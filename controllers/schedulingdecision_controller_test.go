@@ -17,69 +17,226 @@ limitations under the License.
 package controllers
 
 import (
-	"context"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
-	"k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/types"
-	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
+	corev1 "k8s.io/api/core/v1"
+	storagev1 "k8s.io/api/storage/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/rand"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	schedulingv1alpha1 "github.com/phenixblue/sch-audit/api/v1alpha1"
 )
 
-var _ = Describe("SchedulingDecision Controller", func() {
-	Context("When reconciling a resource", func() {
-		const resourceName = "test-resource"
+var _ = Describe("SchedulingDecisionReconciler", func() {
+	const namespace = "default"
 
-		ctx := context.Background()
+	// uniqueName avoids collisions between tests sharing one long-lived
+	// envtest environment and manager.
+	uniqueName := func(prefix string) string {
+		return prefix + "-" + rand.String(8)
+	}
 
-		typeNamespacedName := types.NamespacedName{
-			Name: resourceName,
+	newPod := func(name string) *corev1.Pod {
+		return &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{{Name: "c", Image: "busybox"}},
+			},
 		}
-		schedulingdecision := &schedulingv1alpha1.SchedulingDecision{}
+	}
 
-		BeforeEach(func() {
-			By("creating the custom resource for the Kind SchedulingDecision")
-			err := k8sClient.Get(ctx, typeNamespacedName, schedulingdecision)
-			if err != nil && errors.IsNotFound(err) {
-				resource := &schedulingv1alpha1.SchedulingDecision{
-					ObjectMeta: metav1.ObjectMeta{
-						Name: resourceName,
-					},
-					Spec: schedulingv1alpha1.SchedulingDecisionSpec{
-						PodName:           "test-pod",
-						PodNamespace:      "default",
-						PodUID:            "00000000-0000-0000-0000-000000000000",
-						Outcome:           schedulingv1alpha1.SchedulingOutcomeScheduled,
-						DecisionTimestamp: metav1.Now(),
-					},
-				}
-				Expect(k8sClient.Create(ctx, resource)).To(Succeed())
+	// bindPod sets spec.nodeName via the pods/binding subresource, the only
+	// way the apiserver allows that field to transition from empty (a plain
+	// Update is rejected as an immutable-field change), then refreshes pod
+	// so later Status().Update calls use a current resourceVersion.
+	bindPod := func(pod *corev1.Pod, nodeName string) {
+		binding := &corev1.Binding{
+			ObjectMeta: metav1.ObjectMeta{Name: pod.Name, Namespace: pod.Namespace},
+			Target:     corev1.ObjectReference{Kind: "Node", Name: nodeName},
+		}
+		Expect(k8sClient.SubResource("binding").Create(ctx, pod, binding)).To(Succeed())
+		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(pod), pod)).To(Succeed())
+	}
+
+	setPodScheduledCondition := func(pod *corev1.Pod, status corev1.ConditionStatus, reason, message string) {
+		pod.Status.Conditions = []corev1.PodCondition{{
+			Type:               corev1.PodScheduled,
+			Status:             status,
+			Reason:             reason,
+			Message:            message,
+			LastTransitionTime: metav1.Now(),
+		}}
+		Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
+	}
+
+	fetchDecision := func(podUID types.UID) *schedulingv1alpha1.SchedulingDecision {
+		decision := &schedulingv1alpha1.SchedulingDecision{}
+		Eventually(func() error {
+			return k8sClient.Get(ctx, types.NamespacedName{Name: decisionName(podUID)}, decision)
+		}, 5*time.Second, 100*time.Millisecond).Should(Succeed())
+		return decision
+	}
+
+	It("records a Scheduled decision once the PodScheduled condition is true, exactly once", func() {
+		pod := newPod(uniqueName("scheduled-pod"))
+		Expect(k8sClient.Create(ctx, pod)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, pod) })
+
+		bindPod(pod, "node-1")
+		setPodScheduledCondition(pod, corev1.ConditionTrue, "", "")
+
+		decision := fetchDecision(pod.UID)
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, decision) })
+
+		Expect(decision.Spec.Outcome).To(Equal(schedulingv1alpha1.SchedulingOutcomeScheduled))
+		Expect(decision.Spec.ChosenNode).To(Equal("node-1"))
+		Expect(decision.Spec.PodName).To(Equal(pod.Name))
+		Expect(decision.Spec.PodNamespace).To(Equal(namespace))
+		Expect(decision.Spec.PodUID).To(Equal(pod.UID))
+		Expect(decision.Spec.SchedulerName).To(Equal("default-scheduler")) // pod.Spec.SchedulerName fallback
+		Expect(decision.Labels[podUIDLabel]).To(Equal(string(pod.UID)))
+
+		// Idempotency: forcing another reconcile (via an unrelated update)
+		// must not produce a second decision for the same pod UID.
+		pod.Labels = map[string]string{"touch": rand.String(4)}
+		Expect(k8sClient.Update(ctx, pod)).To(Succeed())
+
+		Consistently(func() (int, error) {
+			var list schedulingv1alpha1.SchedulingDecisionList
+			if err := k8sClient.List(ctx, &list, client.MatchingLabels{podUIDLabel: string(pod.UID)}); err != nil {
+				return 0, err
 			}
-		})
+			return len(list.Items), nil
+		}, 2*time.Second, 200*time.Millisecond).Should(Equal(1))
+	})
 
-		AfterEach(func() {
-			resource := &schedulingv1alpha1.SchedulingDecision{}
-			err := k8sClient.Get(ctx, typeNamespacedName, resource)
-			Expect(err).NotTo(HaveOccurred())
+	It("records a FailedScheduling decision with the predicate-failure message", func() {
+		pod := newPod(uniqueName("unschedulable-pod"))
+		Expect(k8sClient.Create(ctx, pod)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, pod) })
 
-			By("Cleanup the specific resource instance SchedulingDecision")
-			Expect(k8sClient.Delete(ctx, resource)).To(Succeed())
-		})
-		It("should successfully reconcile the resource", func() {
-			By("Reconciling the created resource")
-			controllerReconciler := &SchedulingDecisionReconciler{
-				Client: k8sClient,
-				Scheme: k8sClient.Scheme(),
-			}
+		const failureMessage = "0/3 nodes are available: 3 Insufficient cpu."
+		setPodScheduledCondition(pod, corev1.ConditionFalse, "Unschedulable", failureMessage)
 
-			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
-				NamespacedName: typeNamespacedName,
-			})
-			Expect(err).NotTo(HaveOccurred())
-		})
+		decision := fetchDecision(pod.UID)
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, decision) })
+
+		Expect(decision.Spec.Outcome).To(Equal(schedulingv1alpha1.SchedulingOutcomeFailedScheduling))
+		Expect(decision.Spec.ChosenNode).To(BeEmpty())
+		Expect(decision.Spec.ReasonSummary).To(Equal(failureMessage))
+	})
+
+	It("records a Preempted decision from an Event when the pod still exists", func() {
+		pod := newPod(uniqueName("preempted-pod"))
+		Expect(k8sClient.Create(ctx, pod)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, pod) })
+
+		event := &corev1.Event{
+			ObjectMeta: metav1.ObjectMeta{Name: uniqueName("preempted-pod-evt"), Namespace: namespace},
+			InvolvedObject: corev1.ObjectReference{
+				Kind:      podKind,
+				Namespace: pod.Namespace,
+				Name:      pod.Name,
+				UID:       pod.UID,
+			},
+			Reason:              eventReasonPreempted,
+			Message:             "Preempted by higher-priority-pod on node-2",
+			LastTimestamp:       metav1.Now(),
+			ReportingController: "default-scheduler",
+			Type:                corev1.EventTypeNormal,
+		}
+		Expect(k8sClient.Create(ctx, event)).To(Succeed())
+
+		decision := fetchDecision(pod.UID)
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, decision) })
+
+		Expect(decision.Spec.Outcome).To(Equal(schedulingv1alpha1.SchedulingOutcomePreempted))
+		Expect(decision.Spec.ReasonSummary).To(Equal(event.Message))
+		Expect(decision.Spec.SchedulerName).To(Equal("default-scheduler"))
+		Expect(decision.Spec.SourceRef.EventUID).To(Equal(event.UID))
+	})
+
+	It("records a Preempted decision from an Event even after the pod is gone", func() {
+		pod := newPod(uniqueName("preempted-gone-pod"))
+		Expect(k8sClient.Create(ctx, pod)).To(Succeed())
+		podUID := pod.UID
+
+		event := &corev1.Event{
+			ObjectMeta: metav1.ObjectMeta{Name: uniqueName("preempted-gone-pod-evt"), Namespace: namespace},
+			InvolvedObject: corev1.ObjectReference{
+				Kind:      podKind,
+				Namespace: pod.Namespace,
+				Name:      pod.Name,
+				UID:       podUID,
+			},
+			Reason:        eventReasonPreempted,
+			Message:       "Preempted by higher-priority-pod on node-3",
+			LastTimestamp: metav1.Now(),
+			Type:          corev1.EventTypeNormal,
+		}
+		Expect(k8sClient.Create(ctx, event)).To(Succeed())
+		Expect(k8sClient.Delete(ctx, pod)).To(Succeed())
+
+		decision := fetchDecision(podUID)
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, decision) })
+
+		Expect(decision.Spec.Outcome).To(Equal(schedulingv1alpha1.SchedulingOutcomePreempted))
+		Expect(decision.Spec.PodName).To(Equal(pod.Name))
+		Expect(decision.Spec.PodNamespace).To(Equal(namespace))
+		Expect(decision.Spec.PodUID).To(Equal(podUID))
+	})
+
+	It("resolves volume context from the pod's PVC and StorageClass", func() {
+		scName := uniqueName("fada-sc")
+		bindingMode := storagev1.VolumeBindingWaitForFirstConsumer
+		sc := &storagev1.StorageClass{
+			ObjectMeta:        metav1.ObjectMeta{Name: scName},
+			Provisioner:       "csi.purestorage.com",
+			VolumeBindingMode: &bindingMode,
+		}
+		Expect(k8sClient.Create(ctx, sc)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, sc) })
+
+		pvcName := uniqueName("fada-pvc")
+		pvc := &corev1.PersistentVolumeClaim{
+			ObjectMeta: metav1.ObjectMeta{Name: pvcName, Namespace: namespace},
+			Spec: corev1.PersistentVolumeClaimSpec{
+				AccessModes:      []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+				StorageClassName: &scName,
+				Resources: corev1.VolumeResourceRequirements{
+					Requests: corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("1Gi")},
+				},
+			},
+		}
+		Expect(k8sClient.Create(ctx, pvc)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, pvc) })
+
+		pod := newPod(uniqueName("volume-pod"))
+		pod.Spec.Volumes = []corev1.Volume{{
+			Name: "data",
+			VolumeSource: corev1.VolumeSource{
+				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: pvcName},
+			},
+		}}
+		Expect(k8sClient.Create(ctx, pod)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, pod) })
+
+		bindPod(pod, "node-1")
+		setPodScheduledCondition(pod, corev1.ConditionTrue, "", "")
+
+		decision := fetchDecision(pod.UID)
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, decision) })
+
+		Expect(decision.Spec.VolumeContext).NotTo(BeNil())
+		Expect(decision.Spec.VolumeContext.PVCName).To(Equal(pvcName))
+		Expect(decision.Spec.VolumeContext.StorageClass).To(Equal(scName))
+		Expect(decision.Spec.VolumeContext.DriverType).To(Equal("FADA"))
+		Expect(decision.Spec.VolumeContext.BindingMode).To(Equal(string(storagev1.VolumeBindingWaitForFirstConsumer)))
 	})
 })
