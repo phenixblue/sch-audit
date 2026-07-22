@@ -1,0 +1,22 @@
+apiVersion: scheduling.purestorage.io/v1alpha1
+kind: SchedulingDecision
+metadata:
+  labels:
+    app.kubernetes.io/name: sch-audit
+    app.kubernetes.io/managed-by: kustomize
+  name: schedulingdecision-sample
+spec:
+  podName: example-workload-0
+  podNamespace: default
+  podUID: 11111111-1111-1111-1111-111111111111
+  schedulerName: default-scheduler
+  chosenNode: node-1
+  outcome: Scheduled
+  reasonSummary: "Successfully assigned default/example-workload-0 to node-1"
+  decisionTimestamp: "2026-01-01T00:00:00Z"
+  schedulingLatencyMs: 120
+  volumeContext:
+    pvcName: example-workload-data
+    storageClass: fada-block
+    driverType: FADA
+    bindingMode: WaitForFirstConsumer
