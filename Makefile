@@ -116,6 +116,10 @@ build: manifests generate fmt vet ## Build manager binary.
 run: manifests generate fmt vet ## Run a controller from your host.
 	go run ./cmd/manager/main.go
 
+.PHONY: run-dashboard
+run-dashboard: manifests generate fmt vet ## Run the read-only web dashboard from your host.
+	go run ./cmd/dashboard/main.go
+
 # If you wish to build the manager image targeting other platforms you can use the --platform flag.
 # (i.e. docker build --platform linux/arm64). However, you must enable docker buildKit for it.
 # More info: https://docs.docker.com/develop/develop-images/build_enhancements/

@@ -171,3 +171,16 @@ than silently overwriting or freezing on the wrong one. `candidateNodes` and
 they describe a single scheduling attempt, not the pod as a whole. Printer
 columns for Node/Outcome/LatencyMs now read from `.status` instead of
 `.spec`.
+
+**2026-07-23 — dashboard implemented as `cmd/dashboard`, not a standalone
+`dashboard/` app.** The repo structure above proposed a separate
+`dashboard/` top-level directory, envisioned as possibly its own tech stack.
+Milestone 4 instead ships it as a fourth Go binary (`cmd/dashboard`,
+alongside `manager` and `sweep`) that serves a single self-contained HTML
+page (inline CSS/JS, no build step, no CDN dependencies) compiled in via
+`go:embed`, backed by one JSON endpoint (`/api/decisions`) that all stat
+cards/heatmap/latency-chart/table rendering happens against client-side. It
+shares the same container image, Dockerfile stage, and RBAC (read-only
+`get`/`list`/`watch` on `schedulingdecisions`, already granted) as the other
+two binaries — one build/publish pipeline for the whole project, consistent
+with how retention's `cmd/sweep` was done in Milestone 3.

@@ -145,3 +145,54 @@ kubectl -n sch-audit-system logs job/manual-sweep-1
 `cmd/sweep`'s summary log line (`sweep complete: N total, N deleted, ...`)
 is the quickest way to confirm it did what you expect without having to diff
 the full `sdec` list before/after.
+
+## 4. Running the dashboard
+
+`cmd/dashboard` is a small read-only web UI (stat cards, a node-placement
+heatmap by scheduler, a filterable recent-decisions table, and a
+latency-by-scheduler chart) over the same CRD, rendered client-side from a
+single `/api/decisions` JSON endpoint. It only needs `get`/`list`/`watch` on
+`schedulingdecisions` (already granted to the `controller-manager`
+ServiceAccount), so it's safe to point at a cluster that already has real
+decisions in it. All three ways to run it below serve on `:8080` unless
+told otherwise.
+
+**On your host (fastest loop):**
+
+```sh
+make run-dashboard   # go run ./cmd/dashboard/main.go, same kubeconfig resolution as `make run`
+```
+
+Open `http://localhost:8080`.
+
+**As a Docker container** (useful for checking the image build without a
+full cluster deploy — e.g. against the KinD cluster from step 1, or any
+other cluster's kubeconfig):
+
+```sh
+make docker-build IMG=sch-audit:dev
+docker run --rm -p 8080:8080 \
+  --entrypoint /dashboard \
+  -v ~/.kube/config:/kube/config:ro \
+  -e KUBECONFIG=/kube/config \
+  sch-audit:dev
+```
+
+`--entrypoint /dashboard` is required, not optional: the image's
+`ENTRYPOINT` is `/manager`, and a plain `docker run sch-audit:dev /dashboard`
+(unlike a Kubernetes `command:` override) only appends `/dashboard` as an
+*argument* to `/manager` rather than replacing it — the manager would start
+instead, silently ignoring the extra argument. If your kubeconfig points at
+a real cluster rather than KinD, swap the mounted file accordingly.
+
+**In-cluster** (KinD or a real cluster): the dashboard Deployment and
+Service live alongside the controller manager in `config/manager/`, so
+`make deploy` (step 2b) brings it up automatically — no separate step.
+Reach it with a port-forward:
+
+```sh
+kubectl -n sch-audit-system get pods -l control-plane=dashboard
+kubectl -n sch-audit-system port-forward svc/sch-audit-dashboard 8080:8080
+```
+
+Then open `http://localhost:8080`.

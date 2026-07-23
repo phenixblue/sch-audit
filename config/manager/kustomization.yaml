@@ -1,3 +1,4 @@
 resources:
 - manager.yaml
 - sweep_cronjob.yaml
+- dashboard.yaml

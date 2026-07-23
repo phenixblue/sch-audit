@@ -24,6 +24,9 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -a -o ma
 # config/manager/sweep_cronjob.yaml); it ships in the same image as manager
 # so there's one build/publish pipeline for the whole project.
 RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -a -o sweep cmd/sweep/main.go
+# dashboard serves the read-only web UI (config/manager/dashboard.yaml); its
+# static assets are compiled in via go:embed, so nothing else needs copying.
+RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -a -o dashboard cmd/dashboard/main.go
 
 # Use distroless as minimal base image to package the manager binary
 # Refer to https://github.com/GoogleContainerTools/distroless for more details
@@ -31,6 +34,7 @@ FROM gcr.io/distroless/static:nonroot
 WORKDIR /
 COPY --from=builder /workspace/manager .
 COPY --from=builder /workspace/sweep .
+COPY --from=builder /workspace/dashboard .
 USER 65532:65532
 
 ENTRYPOINT ["/manager"]

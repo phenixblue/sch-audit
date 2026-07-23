@@ -9,3 +9,6 @@
 # Re-include Go module files
 !go.mod
 !go.sum
+
+# Re-include static assets compiled in via go:embed (cmd/dashboard)
+!cmd/dashboard/static/**
