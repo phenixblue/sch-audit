@@ -93,6 +93,10 @@
   .panel h2 { margin: 0 0 14px; font-size: 14px; font-weight: 600; }
   .panel .empty { color: var(--muted); font-size: 13px; padding: 12px 0; }
 
+  /* Capped height, not width: nodes are rows now, so a cluster with many
+     nodes grows this list downward - scroll vertically within the panel
+     rather than stretching the whole page or overflowing sideways. */
+  #heatmap { max-height: 360px; overflow: auto; }
   #heatmap-table { width: 100%; border-collapse: collapse; font-size: 12px; }
   #heatmap-table th, #heatmap-table td {
     padding: 6px 8px;
@@ -102,6 +106,7 @@
   }
   #heatmap-table th.row-label, #heatmap-table td.row-label { text-align: left; font-weight: 600; }
   #heatmap-table td.cell { color: var(--text); font-weight: 600; }
+  #heatmap-table thead th { position: sticky; top: 0; background: var(--panel); }
 
   .bar-row { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
   .bar-row .name { width: 130px; flex-shrink: 0; font-size: 12px; color: var(--muted); text-align: right; }
@@ -309,12 +314,17 @@
       max = Math.max(max, (counts[s] && counts[s][n]) || 0);
     }); });
 
-    var html = '<table id="heatmap-table"><thead><tr><th class="row-label">Scheduler \\ Node</th>';
-    nodeList.forEach(function (n) { html += '<th>' + escapeHtml(n) + '</th>'; });
+    // Nodes as rows, schedulers as columns: a cluster typically has a
+    // handful of schedulers but can have dozens+ of nodes, so this keeps
+    // the table narrow (fits without horizontal scrolling) and lets a long
+    // node list scroll vertically instead - the more natural direction for
+    // a growing list, and the wrapper below caps how tall it can get.
+    var html = '<table id="heatmap-table"><thead><tr><th class="row-label">Node \\ Scheduler</th>';
+    schedulerList.forEach(function (s) { html += '<th>' + escapeHtml(s) + '</th>'; });
     html += '</tr></thead><tbody>';
-    schedulerList.forEach(function (s) {
-      html += '<tr><td class="row-label">' + escapeHtml(s) + '</td>';
-      nodeList.forEach(function (n) {
+    nodeList.forEach(function (n) {
+      html += '<tr><td class="row-label">' + escapeHtml(n) + '</td>';
+      schedulerList.forEach(function (s) {
         var v = (counts[s] && counts[s][n]) || 0;
         var alpha = v ? (0.15 + 0.65 * (v / max)) : 0;
         var style = v ? ('background: rgba(54,84,224,' + alpha.toFixed(2) + ');') : '';
