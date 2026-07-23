@@ -265,51 +265,64 @@ var _ = Describe("SchedulingDecisionReconciler", func() {
 		Expect(decision.Spec.PodUID).To(Equal(podUID))
 	})
 
-	It("resolves volume context from the pod's PVC and StorageClass", func() {
-		scName := uniqueName("fada-sc")
-		bindingMode := storagev1.VolumeBindingWaitForFirstConsumer
-		sc := &storagev1.StorageClass{
-			ObjectMeta:        metav1.ObjectMeta{Name: scName},
-			Provisioner:       "csi.purestorage.com",
-			VolumeBindingMode: &bindingMode,
-		}
-		Expect(k8sClient.Create(ctx, sc)).To(Succeed())
-		DeferCleanup(func() { _ = k8sClient.Delete(ctx, sc) })
+	// Milestone 5 (validate against a real cluster) confirmed default-scheduler
+	// + STORK + PX-CSI (Portworx) end to end against a live OpenShift cluster.
+	// FADA and vsphere-csi aren't reachable from this environment (no FlashArray
+	// or vSphere cluster available), so this DescribeTable exercises all three
+	// plan-named drivers through the same real reconciler/envtest pipeline
+	// instead - the only thing that varies per driver is the StorageClass's
+	// provisioner string, so one parameterized flow covers them all without
+	// re-proving the PVC/pod/bind/condition scaffolding three times over.
+	DescribeTable("resolves volume context for a StorageClass's provisioner",
+		func(provisioner, expectedDriver string) {
+			scName := uniqueName("sc")
+			bindingMode := storagev1.VolumeBindingWaitForFirstConsumer
+			sc := &storagev1.StorageClass{
+				ObjectMeta:        metav1.ObjectMeta{Name: scName},
+				Provisioner:       provisioner,
+				VolumeBindingMode: &bindingMode,
+			}
+			Expect(k8sClient.Create(ctx, sc)).To(Succeed())
+			DeferCleanup(func() { _ = k8sClient.Delete(ctx, sc) })
 
-		pvcName := uniqueName("fada-pvc")
-		pvc := &corev1.PersistentVolumeClaim{
-			ObjectMeta: metav1.ObjectMeta{Name: pvcName, Namespace: namespace},
-			Spec: corev1.PersistentVolumeClaimSpec{
-				AccessModes:      []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
-				StorageClassName: &scName,
-				Resources: corev1.VolumeResourceRequirements{
-					Requests: corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("1Gi")},
+			pvcName := uniqueName("pvc")
+			pvc := &corev1.PersistentVolumeClaim{
+				ObjectMeta: metav1.ObjectMeta{Name: pvcName, Namespace: namespace},
+				Spec: corev1.PersistentVolumeClaimSpec{
+					AccessModes:      []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+					StorageClassName: &scName,
+					Resources: corev1.VolumeResourceRequirements{
+						Requests: corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("1Gi")},
+					},
 				},
-			},
-		}
-		Expect(k8sClient.Create(ctx, pvc)).To(Succeed())
-		DeferCleanup(func() { _ = k8sClient.Delete(ctx, pvc) })
+			}
+			Expect(k8sClient.Create(ctx, pvc)).To(Succeed())
+			DeferCleanup(func() { _ = k8sClient.Delete(ctx, pvc) })
 
-		pod := newPod(uniqueName("volume-pod"))
-		pod.Spec.Volumes = []corev1.Volume{{
-			Name: "data",
-			VolumeSource: corev1.VolumeSource{
-				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: pvcName},
-			},
-		}}
-		Expect(k8sClient.Create(ctx, pod)).To(Succeed())
-		DeferCleanup(func() { _ = k8sClient.Delete(ctx, pod) })
+			pod := newPod(uniqueName("volume-pod"))
+			pod.Spec.Volumes = []corev1.Volume{{
+				Name: "data",
+				VolumeSource: corev1.VolumeSource{
+					PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: pvcName},
+				},
+			}}
+			Expect(k8sClient.Create(ctx, pod)).To(Succeed())
+			DeferCleanup(func() { _ = k8sClient.Delete(ctx, pod) })
 
-		bindPod(pod, "node-1")
-		setPodScheduledCondition(pod, corev1.ConditionTrue, "", "")
+			bindPod(pod, "node-1")
+			setPodScheduledCondition(pod, corev1.ConditionTrue, "", "")
 
-		decision := fetchDecision(pod.UID)
-		DeferCleanup(func() { _ = k8sClient.Delete(ctx, decision) })
+			decision := fetchDecision(pod.UID)
+			DeferCleanup(func() { _ = k8sClient.Delete(ctx, decision) })
 
-		Expect(decision.Spec.VolumeContext).NotTo(BeNil())
-		Expect(decision.Spec.VolumeContext.PVCName).To(Equal(pvcName))
-		Expect(decision.Spec.VolumeContext.StorageClass).To(Equal(scName))
-		Expect(decision.Spec.VolumeContext.DriverType).To(Equal("FADA"))
-		Expect(decision.Spec.VolumeContext.BindingMode).To(Equal(string(storagev1.VolumeBindingWaitForFirstConsumer)))
-	})
+			Expect(decision.Spec.VolumeContext).NotTo(BeNil())
+			Expect(decision.Spec.VolumeContext.PVCName).To(Equal(pvcName))
+			Expect(decision.Spec.VolumeContext.StorageClass).To(Equal(scName))
+			Expect(decision.Spec.VolumeContext.DriverType).To(Equal(expectedDriver))
+			Expect(decision.Spec.VolumeContext.BindingMode).To(Equal(string(storagev1.VolumeBindingWaitForFirstConsumer)))
+		},
+		Entry("FADA (Pure Storage FlashArray CSI)", "csi.purestorage.com", "FADA"),
+		Entry("PX-CSI (Portworx)", "pxd.portworx.com", "PX-CSI"),
+		Entry("vsphere-csi", "csi.vsphere.vmware.com", "vsphere-csi"),
+	)
 })

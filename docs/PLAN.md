@@ -184,3 +184,21 @@ shares the same container image, Dockerfile stage, and RBAC (read-only
 `get`/`list`/`watch` on `schedulingdecisions`, already granted) as the other
 two binaries — one build/publish pipeline for the whole project, consistent
 with how retention's `cmd/sweep` was done in Milestone 3.
+
+**2026-07-23 — Milestone 5 (validate against a real cluster) status.**
+default-scheduler, STORK, and PX-CSI (Portworx) were validated end-to-end
+against a live OpenShift cluster (Portworx + STORK + OpenShift
+Virtualization) during Milestones 2-4's development: real Pods, VMs, and
+Portworx-backed PVCs produced correct `SchedulingDecision` records,
+including the transient-`FailedScheduling`-then-`Scheduled` retry sequence
+that motivated the spec/status redesign above, and the dashboard rendering
+that data correctly. FADA (Pure Storage FlashArray CSI) and vsphere-csi
+weren't reachable from this environment (no FlashArray or vSphere cluster
+available), so those two are validated only via envtest integration tests
+(`controllers/schedulingdecision_controller_test.go`'s
+"resolves volume context for a StorageClass's provisioner" table, which
+also covers PX-CSI) rather than a real array/vSphere-backed cluster. The
+provisioner→driver-label mapping is a static lookup shared across all
+entries in `provisionerDriverLabels`, so this is low-risk, but it's a real
+gap if either array type surfaces its own scheduling quirks the way STORK's
+Immediate-binding retry loop did.
