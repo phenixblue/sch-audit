@@ -196,3 +196,59 @@ kubectl -n sch-audit-system port-forward svc/sch-audit-dashboard 8080:8080
 ```
 
 Then open `http://localhost:8080`.
+
+## 5. Testing the extender observer
+
+`cmd/extender` is the optional scheduler-Extender from Milestone 6's Tier 2
+follow-up (see `docs/tier2-investigation.md`) — it observes the post-Filter
+candidate node list for a pod and records it as a `CandidateNodes` Event,
+which the reconciler folds into `status.transitions[].candidateNodes`. It
+never rejects a node, so it can't change scheduling outcomes. It is **not**
+registered with any scheduler by default; deploying it just makes the
+`/filter` endpoint reachable, it doesn't do anything until something calls
+it. Two ways to exercise it without a real scheduler in the loop:
+
+**On your host:**
+
+```sh
+make run-extender   # go run ./cmd/extender/main.go, same kubeconfig resolution as `make run`
+```
+
+**As a Docker container** (same `--entrypoint` gotcha as the dashboard
+above):
+
+```sh
+make docker-build IMG=sch-audit:dev
+docker run --rm -p 8099:8099 \
+  --entrypoint /extender \
+  -v ~/.kube/config:/kube/config:ro \
+  -e KUBECONFIG=/kube/config \
+  sch-audit:dev
+```
+
+Either way, simulate a scheduler's Filter call directly with curl — this is
+exactly the request shape a real `KubeSchedulerConfiguration` extender entry
+would send:
+
+```sh
+curl -s -X POST http://localhost:8099/filter \
+  -H "Content-Type: application/json" \
+  -d '{
+    "Pod": {
+      "metadata": {"name": "test-pod", "namespace": "default", "uid": "11111111-2222-3333-4444-555555555555"},
+      "spec": {"containers": [{"name": "c", "image": "busybox"}]}
+    },
+    "NodeNames": ["node-alpha", "node-beta", "node-gamma"]
+  }'
+# response should echo back all 3 node names unchanged, with no FailedNodes
+kubectl get events --field-selector reason=CandidateNodes
+```
+
+Registering it against a real scheduler (adding an entry to that
+scheduler's `KubeSchedulerConfiguration.extenders[]`) is deliberately out of
+scope for this binary or its manifests to do on their own — see the comment
+at the top of `config/manager/extender.yaml` for the config shape, and
+`docs/tier2-investigation.md` for why that's usually an edit to a
+ConfigMap owned by whatever installed the target scheduler (e.g. an
+operator), not something to change without understanding who else manages
+it.

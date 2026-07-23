@@ -52,6 +52,10 @@ var _ = Describe("SchedulingDecisionReconciler", func() {
 		}
 	}
 
+	// boundNode is the node every test below binds its pod to; a plain
+	// constant since every test needs the same one value.
+	const boundNode = "node-1"
+
 	// bindPod sets spec.nodeName via the pods/binding subresource, the only
 	// way the apiserver allows that field to transition from empty (a plain
 	// Update is rejected as an immutable-field change), then refreshes pod
@@ -61,10 +65,10 @@ var _ = Describe("SchedulingDecisionReconciler", func() {
 	// write for a moment, and a Get that lands in that window would hand
 	// back a resourceVersion that's already stale, making the caller's next
 	// Status().Update conflict.
-	bindPod := func(pod *corev1.Pod, nodeName string) {
+	bindPod := func(pod *corev1.Pod) {
 		binding := &corev1.Binding{
 			ObjectMeta: metav1.ObjectMeta{Name: pod.Name, Namespace: pod.Namespace},
-			Target:     corev1.ObjectReference{Kind: "Node", Name: nodeName},
+			Target:     corev1.ObjectReference{Kind: "Node", Name: boundNode},
 		}
 		Expect(k8sClient.SubResource("binding").Create(ctx, pod, binding)).To(Succeed())
 
@@ -73,7 +77,7 @@ var _ = Describe("SchedulingDecisionReconciler", func() {
 				return "", err
 			}
 			return pod.Spec.NodeName, nil
-		}, 5*time.Second, 50*time.Millisecond).Should(Equal(nodeName))
+		}, 5*time.Second, 50*time.Millisecond).Should(Equal(boundNode))
 	}
 
 	setPodScheduledCondition := func(pod *corev1.Pod, status corev1.ConditionStatus, reason, message string) {
@@ -108,7 +112,7 @@ var _ = Describe("SchedulingDecisionReconciler", func() {
 		Expect(k8sClient.Create(ctx, pod)).To(Succeed())
 		DeferCleanup(func() { _ = k8sClient.Delete(ctx, pod) })
 
-		bindPod(pod, "node-1")
+		bindPod(pod)
 		setPodScheduledCondition(pod, corev1.ConditionTrue, "", "")
 
 		decision := fetchDecision(pod.UID)
@@ -188,7 +192,7 @@ var _ = Describe("SchedulingDecisionReconciler", func() {
 		Expect(decision.Status.Outcome).To(Equal(schedulingv1alpha1.SchedulingOutcomeFailedScheduling))
 		Expect(decision.Status.Transitions).To(HaveLen(1))
 
-		bindPod(pod, "node-1")
+		bindPod(pod)
 		setPodScheduledCondition(pod, corev1.ConditionTrue, "", "")
 
 		Eventually(func() (schedulingv1alpha1.SchedulingOutcome, error) {
@@ -309,7 +313,7 @@ var _ = Describe("SchedulingDecisionReconciler", func() {
 			Expect(k8sClient.Create(ctx, pod)).To(Succeed())
 			DeferCleanup(func() { _ = k8sClient.Delete(ctx, pod) })
 
-			bindPod(pod, "node-1")
+			bindPod(pod)
 			setPodScheduledCondition(pod, corev1.ConditionTrue, "", "")
 
 			decision := fetchDecision(pod.UID)
@@ -325,4 +329,38 @@ var _ = Describe("SchedulingDecisionReconciler", func() {
 		Entry("PX-CSI (Portworx)", "pxd.portworx.com", "PX-CSI"),
 		Entry("vsphere-csi", "csi.vsphere.vmware.com", "vsphere-csi"),
 	)
+
+	It("folds a CandidateNodes Event (from the optional extender observer) into the transition", func() {
+		pod := newPod(uniqueName("candidates-pod"))
+		Expect(k8sClient.Create(ctx, pod)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, pod) })
+
+		// Mimics exactly what cmd/extender's filterHandler creates.
+		candidatesEvent := &corev1.Event{
+			ObjectMeta: metav1.ObjectMeta{Name: uniqueName("candidates-evt"), Namespace: namespace},
+			InvolvedObject: corev1.ObjectReference{
+				Kind: podKind, Namespace: pod.Namespace, Name: pod.Name, UID: pod.UID,
+			},
+			Reason:              eventReasonCandidateNodes,
+			Message:             "node-1,node-2,node-3",
+			LastTimestamp:       metav1.Now(),
+			ReportingController: "sch-audit-extender",
+			Type:                corev1.EventTypeNormal,
+		}
+		Expect(k8sClient.Create(ctx, candidatesEvent)).To(Succeed())
+
+		bindPod(pod)
+		setPodScheduledCondition(pod, corev1.ConditionTrue, "", "")
+
+		decision := fetchDecision(pod.UID)
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, decision) })
+
+		Expect(decision.Status.Outcome).To(Equal(schedulingv1alpha1.SchedulingOutcomeScheduled))
+		Expect(decision.Status.Transitions).To(HaveLen(1))
+		Expect(decision.Status.Transitions[0].CandidateNodes).To(ConsistOf(
+			schedulingv1alpha1.CandidateNode{Name: "node-1"},
+			schedulingv1alpha1.CandidateNode{Name: "node-2"},
+			schedulingv1alpha1.CandidateNode{Name: "node-3"},
+		))
+	})
 })

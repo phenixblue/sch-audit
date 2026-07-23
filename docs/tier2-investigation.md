@@ -118,6 +118,24 @@ produce from Events alone, and needs no custom scheduler build. It still
 wouldn't include `candidateNodes[].score`, since that's exactly the data an
 extender never sees.
 
+**Implemented (2026-07-23): `cmd/extender`.** A pure-observer Extender that
+implements only the Filter verb, always returning every node it's given as
+still eligible - it cannot change a scheduling outcome, only see one. On
+each Filter call it creates a `CandidateNodes` Event on the pod (message: a
+comma-separated node name list), which the reconciler already watches for
+via the same `involvedObject` index used for Scheduled/FailedScheduling/
+Preempted, and folds into `status.transitions[].candidateNodes` alongside
+whichever outcome is being recorded. Verified end-to-end against the real
+aetos-ocp1 cluster: a Filter-shaped request produced the expected
+passthrough response and a real, correctly-attributed Event. Deployed
+alongside the manager (`config/manager/extender.yaml`) but **not wired into
+any scheduler** - registering it means editing a scheduler's
+`KubeSchedulerConfiguration.extenders[]`, which for the schedulers this
+project targets means editing a ConfigMap owned by an operator (OpenShift's
+cluster-kube-scheduler-operator, or Portworx's for STORK) that could revert
+an unmanaged change; deliberately left as a separate, explicitly-decided
+step rather than something this repo does on its own.
+
 ## Addendum: API / metrics / log scraping, checked directly
 
 A natural follow-up: is there some *other*, non-plugin way to observe

@@ -64,6 +64,11 @@ const (
 	podKind                     = "Pod"
 )
 
+// eventReasonCandidateNodes is created by the optional cmd/extender
+// observer (see api/v1alpha1.CandidateNodesEventReason's doc comment); its
+// message is a comma-separated candidate node name list.
+const eventReasonCandidateNodes = schedulingv1alpha1.CandidateNodesEventReason
+
 // relevantEventReasons are the only core/v1 Event reasons this controller
 // cares about; every other Event reason is ignored by the watch predicate
 // and the index-backed List in listRelevantEvents.
@@ -71,6 +76,7 @@ var relevantEventReasons = map[string]struct{}{
 	eventReasonScheduled:        {},
 	eventReasonFailedScheduling: {},
 	eventReasonPreempted:        {},
+	eventReasonCandidateNodes:   {},
 }
 
 // SchedulingDecisionReconciler reconstructs SchedulingDecision records from

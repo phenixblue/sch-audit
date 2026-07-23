@@ -27,6 +27,10 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -a -o sw
 # dashboard serves the read-only web UI (config/manager/dashboard.yaml); its
 # static assets are compiled in via go:embed, so nothing else needs copying.
 RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -a -o dashboard cmd/dashboard/main.go
+# extender is the optional scheduler-Extender observer (config/manager/
+# extender.yaml); not wired into any scheduler by default - see
+# docs/tier2-investigation.md and cmd/extender's package doc.
+RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -a -o extender cmd/extender/main.go
 
 # Use distroless as minimal base image to package the manager binary
 # Refer to https://github.com/GoogleContainerTools/distroless for more details
@@ -35,6 +39,7 @@ WORKDIR /
 COPY --from=builder /workspace/manager .
 COPY --from=builder /workspace/sweep .
 COPY --from=builder /workspace/dashboard .
+COPY --from=builder /workspace/extender .
 USER 65532:65532
 
 ENTRYPOINT ["/manager"]

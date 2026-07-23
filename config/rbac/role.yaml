@@ -8,8 +8,8 @@ rules:
   - ""
   resources:
   - events
-  - pods
   verbs:
+  - create
   - get
   - list
   - watch
@@ -20,6 +20,14 @@ rules:
   verbs:
   - get
   - list
+- apiGroups:
+  - ""
+  resources:
+  - pods
+  verbs:
+  - get
+  - list
+  - watch
 - apiGroups:
   - scheduling.purestorage.io
   resources:

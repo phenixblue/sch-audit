@@ -18,6 +18,7 @@ package controllers
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -44,12 +45,12 @@ type podIdentity struct {
 // triggered by the Pod's status changing or a relevant Event arriving, picks
 // this back up.
 //
-// candidateNodes (per-node filter results and Tier 2 scores) is
-// intentionally left unpopulated here: the default scheduler's
-// FailedScheduling Event carries a single aggregate message across all
-// nodes, not a per-node breakdown, so reasonSummary is the highest-fidelity
-// Tier 1 signal available. Real per-node data is a Tier 2 (scheduling
-// framework hook) concern.
+// candidateNodes is attached to Scheduled/FailedScheduling transitions from
+// whatever the optional cmd/extender observer has most recently reported
+// (see candidateNodesFrom) - left nil if that extender isn't deployed and
+// registered with the scheduler. Not attached to Preempted: a preemption
+// isn't itself a fresh scheduling attempt with its own candidate list in
+// the same sense.
 func deriveTransition(
 	pod *corev1.Pod, podFound bool, events []corev1.Event,
 ) (podIdentity, *schedulingv1alpha1.SchedulingTransition, bool) {
@@ -68,15 +69,21 @@ func deriveTransition(
 		return podIdentity{}, nil, false
 	}
 
+	candidateNodes := candidateNodesFrom(events)
+
 	if cond := podScheduledCondition(pod); cond != nil {
 		switch cond.Status {
 		case corev1.ConditionTrue:
 			evt := latestEventWithReason(events, eventReasonScheduled)
-			return identityFromPod(pod, evt), transitionFromScheduled(pod, cond, evt), true
+			t := transitionFromScheduled(pod, cond, evt)
+			t.CandidateNodes = candidateNodes
+			return identityFromPod(pod, evt), t, true
 		case corev1.ConditionFalse:
 			if cond.Reason == "Unschedulable" {
 				evt := latestEventWithReason(events, eventReasonFailedScheduling)
-				return identityFromPod(pod, evt), transitionFromFailedScheduling(pod, cond, evt), true
+				t := transitionFromFailedScheduling(pod, cond, evt)
+				t.CandidateNodes = candidateNodes
+				return identityFromPod(pod, evt), t, true
 			}
 		case corev1.ConditionUnknown:
 			// Fall through to the Event-only fallback below.
@@ -86,10 +93,14 @@ func deriveTransition(
 	// The PodScheduled condition hasn't synced to the cache yet (or wasn't
 	// conclusive); fall back to whatever the Event informer already has.
 	if evt := latestEventWithReason(events, eventReasonScheduled); evt != nil {
-		return identityFromPod(pod, evt), transitionFromScheduled(pod, nil, evt), true
+		t := transitionFromScheduled(pod, nil, evt)
+		t.CandidateNodes = candidateNodes
+		return identityFromPod(pod, evt), t, true
 	}
 	if evt := latestEventWithReason(events, eventReasonFailedScheduling); evt != nil {
-		return identityFromPod(pod, evt), transitionFromFailedScheduling(pod, nil, evt), true
+		t := transitionFromFailedScheduling(pod, nil, evt)
+		t.CandidateNodes = candidateNodes
+		return identityFromPod(pod, evt), t, true
 	}
 
 	return podIdentity{}, nil, false
@@ -233,6 +244,35 @@ func latestEventWithReason(events []corev1.Event, reason string) *corev1.Event {
 		}
 	}
 	return latest
+}
+
+// candidateNodesFrom parses the most recent CandidateNodes Event (created
+// by the optional cmd/extender observer) into CandidateNode entries, or nil
+// if that extender isn't deployed and registered with the scheduler, or
+// hasn't reported anything for this pod yet. Doesn't try to correlate a
+// specific Event to a specific scheduling attempt when a pod has gone
+// through more than one (e.g. a retry loop) - it always uses whichever
+// CandidateNodes Event is newest, same "best effort, eventually consistent"
+// approach the rest of this reconciler already takes.
+func candidateNodesFrom(events []corev1.Event) []schedulingv1alpha1.CandidateNode {
+	evt := latestEventWithReason(events, eventReasonCandidateNodes)
+	if evt == nil || evt.Message == "" {
+		return nil
+	}
+
+	names := strings.Split(evt.Message, ",")
+	nodes := make([]schedulingv1alpha1.CandidateNode, 0, len(names))
+	for _, n := range names {
+		n = strings.TrimSpace(n)
+		if n == "" {
+			continue
+		}
+		nodes = append(nodes, schedulingv1alpha1.CandidateNode{Name: n})
+	}
+	if len(nodes) == 0 {
+		return nil
+	}
+	return nodes
 }
 
 func eventTimestamp(e corev1.Event) time.Time {

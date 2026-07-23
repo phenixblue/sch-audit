@@ -26,3 +26,10 @@ package v1alpha1
 // The value is a Unix timestamp, not RFC3339, because Kubernetes label
 // values can't contain colons.
 const ExpiresAtLabel = "scheduling.purestorage.io/expires-at"
+
+// CandidateNodesEventReason is the Event Reason cmd/extender creates
+// (message: a comma-separated node name list) when it observes a Filter
+// call for a pod. It's exported because both cmd/extender (which creates
+// these Events) and the controller (which watches for them to populate a
+// transition's candidateNodes) need the exact same string.
+const CandidateNodesEventReason = "CandidateNodes"

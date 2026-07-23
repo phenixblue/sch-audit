@@ -167,27 +167,40 @@ spec:
                     candidateNodes:
                       description: |-
                         candidateNodes lists nodes considered during this scheduling attempt.
-                        Populated with the rejected-node/reason pairs available from Tier 1
-                        reconstruction; scores are Tier 2 only.
+                        Empty unless cmd/extender is deployed and registered with the
+                        scheduler; see CandidateNode's doc comment for what it can and can't
+                        populate.
                       items:
                         description: |-
                           CandidateNode captures the fate of a single node considered during a
-                          scheduling attempt. Score is only populated by Tier 2 (scheduling
-                          framework hook) capture; Tier 1 reconstruction from Events cannot see
-                          per-node scores for nodes that passed filtering.
+                          scheduling attempt.
+
+                          name is populated by the optional scheduler-extender-based observer
+                          (cmd/extender, registered as an additional entry in a scheduler's
+                          KubeSchedulerConfiguration extenders list) if one is deployed and
+                          registered - it reports the post-Filter candidate list, but as an
+                          Extender it never sees the internal per-plugin scores, so filterResult
+                          and score are left empty. Both would require a scheduling-framework
+                          plugin compiled into the scheduler binary itself (full Tier 2), which
+                          isn't attachable to a scheduler this project doesn't build; see
+                          docs/tier2-investigation.md.
                         properties:
                           filterResult:
                             description: |-
                               filterResult is the predicate-failure string reported for this node,
-                              if the node was rejected during filtering.
+                              if the node was rejected during filtering. Not populated by the
+                              extender-based observer, which never rejects nodes (see cmd/extender);
+                              would require full Tier 2 (scheduling-framework plugin) capture.
                             type: string
                           name:
                             description: name is the node name.
                             type: string
                           score:
                             description: |-
-                              score is the node's score at decision time. Only populated by Tier 2
-                              capture.
+                              score is the node's score at decision time. Not populated by the
+                              extender-based observer - an Extender never sees the scheduler's
+                              internal per-plugin scores (see docs/tier2-investigation.md); would
+                              require full Tier 2 (scheduling-framework plugin) capture.
                             format: int64
                             type: integer
                         required:

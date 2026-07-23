@@ -1,0 +1,96 @@
+# This Deployment/Service is not wired into any scheduler by default - it's
+# an optional component. Registering it means adding an entry to a
+# scheduler's KubeSchedulerConfiguration `extenders` list pointing at this
+# Service, e.g.:
+#
+#   extenders:
+#   - filterVerb: filter
+#     urlPrefix: http://sch-audit-extender.sch-audit-system:8099
+#     nodeCacheCapable: true
+#     weight: 1
+#
+# See docs/tier2-investigation.md for what this can and can't observe, and
+# why that config change is out of scope for this repo to apply on its own
+# (it typically means editing a ConfigMap owned by whatever installed the
+# target scheduler - e.g. an operator - which may revert an unmanaged edit).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: extender
+  namespace: system
+  labels:
+    control-plane: extender
+    app.kubernetes.io/name: sch-audit
+    app.kubernetes.io/managed-by: kustomize
+spec:
+  selector:
+    matchLabels:
+      control-plane: extender
+      app.kubernetes.io/name: sch-audit
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        control-plane: extender
+        app.kubernetes.io/name: sch-audit
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+      - command:
+        - /extender
+        args:
+          - --addr=:8099
+        image: controller:latest
+        name: extender
+        ports:
+        - containerPort: 8099
+          name: http
+          protocol: TCP
+        securityContext:
+          readOnlyRootFilesystem: true
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - "ALL"
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: http
+          initialDelaySeconds: 5
+          periodSeconds: 20
+        readinessProbe:
+          httpGet:
+            path: /healthz
+            port: http
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        resources:
+          limits:
+            cpu: 200m
+            memory: 128Mi
+          requests:
+            cpu: 10m
+            memory: 32Mi
+      serviceAccountName: controller-manager
+      terminationGracePeriodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: extender
+  namespace: system
+  labels:
+    control-plane: extender
+    app.kubernetes.io/name: sch-audit
+    app.kubernetes.io/managed-by: kustomize
+spec:
+  selector:
+    control-plane: extender
+    app.kubernetes.io/name: sch-audit
+  ports:
+  - name: http
+    port: 8099
+    targetPort: http
