@@ -129,12 +129,21 @@ sch-audit/
    STORK, confirm decisions are captured correctly for FADA, PX-CSI, and
    vsphere-csi backed workloads
 6. **Tier 2 investigation** — spike a scheduling-framework plugin for
-   per-node score capture; assess STORK extender compatibility
+   per-node score capture; assess STORK extender compatibility. **Done** as
+   a research spike (see `docs/tier2-investigation.md`) — recommendation is
+   to defer implementation; not practically achievable for OpenShift's
+   default-scheduler or STORK without upstream cooperation this project
+   doesn't control.
 
 ## Open questions
 
-- Does STORK's extender interface expose enough to attribute `schedulerName`
-  cleanly, or does it always show as the underlying scheduler it wraps?
+- ~~Does STORK's extender interface expose enough to attribute
+  `schedulerName` cleanly, or does it always show as the underlying
+  scheduler it wraps?~~ **Resolved** — yes, cleanly: STORK registers as its
+  own `schedulerName: stork` scheduling-framework profile (on the stock
+  kube-scheduler binary) with its storage-locality logic bolted on via the
+  legacy Extender API, not a default-scheduler wrapper. See
+  `docs/tier2-investigation.md`.
 - Cluster-scoped vs namespaced CRD — cluster-scoped is simpler for a
   cross-namespace dashboard view, but namespaced would align RBAC more
   tightly with existing per-namespace access patterns. Defaulting to
