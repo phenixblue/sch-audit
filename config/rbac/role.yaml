@@ -26,9 +26,18 @@ rules:
   - schedulingdecisions
   verbs:
   - create
+  - delete
   - get
   - list
   - watch
+- apiGroups:
+  - scheduling.purestorage.io
+  resources:
+  - schedulingdecisions/status
+  verbs:
+  - get
+  - patch
+  - update
 - apiGroups:
   - storage.k8s.io
   resources:

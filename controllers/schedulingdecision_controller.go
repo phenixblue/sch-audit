@@ -19,11 +19,15 @@ package controllers
 import (
 	"context"
 	"fmt"
+	"strconv"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -45,6 +49,12 @@ const eventInvolvedObjectIndex = "involvedObject.nsName"
 // UID, regardless of how many times the underlying Pod/Event objects are
 // reconciled.
 const podUIDLabel = "scheduling.purestorage.io/pod-uid"
+
+// DefaultRetentionWindow is used when a SchedulingDecisionReconciler's
+// RetentionWindow is left zero-valued (e.g. by tests, or any other caller
+// that doesn't care about retention), and is also the flag default wired up
+// in cmd/manager.
+const DefaultRetentionWindow = 72 * time.Hour
 
 // Event reason and involvedObject.kind values this controller looks for.
 const (
@@ -70,21 +80,38 @@ var relevantEventReasons = map[string]struct{}{
 type SchedulingDecisionReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
+
+	// RetentionWindow is how long a SchedulingDecision is kept before it's
+	// eligible for deletion by the retention sweep (cmd/sweep). Zero means
+	// DefaultRetentionWindow.
+	RetentionWindow time.Duration
+}
+
+// retentionWindow returns r.RetentionWindow, falling back to
+// DefaultRetentionWindow when it hasn't been set.
+func (r *SchedulingDecisionReconciler) retentionWindow() time.Duration {
+	if r.RetentionWindow > 0 {
+		return r.RetentionWindow
+	}
+	return DefaultRetentionWindow
 }
 
 // +kubebuilder:rbac:groups=scheduling.purestorage.io,resources=schedulingdecisions,verbs=get;list;watch;create
+// +kubebuilder:rbac:groups=scheduling.purestorage.io,resources=schedulingdecisions/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=events,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list
 // +kubebuilder:rbac:groups=storage.k8s.io,resources=storageclasses,verbs=get;list
 
-// Reconcile observes a single Pod's scheduling outcome and, the first time
-// enough information is available to describe it, creates a corresponding
-// SchedulingDecision. It is idempotent: once a decision exists for a Pod's
-// UID, further reconciles of that Pod are no-ops.
+// Reconcile observes a single Pod's scheduling outcome and records it as a
+// transition on the corresponding SchedulingDecision, creating the decision
+// the first time enough information is available to describe one. A
+// scheduler's belief about a pod's outcome isn't necessarily terminal the
+// first time it's observed (e.g. a transient FailedScheduling while a PVC
+// is still binding, followed by a Scheduled once it does), so later
+// reconciles that observe a new outcome append to the decision's status
+// history instead of leaving the first-ever observation stuck in place.
 func (r *SchedulingDecisionReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	log := logf.FromContext(ctx)
-
 	events, err := r.listRelevantEvents(ctx, req.NamespacedName)
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("listing events for pod %s: %w", req.NamespacedName, err)
@@ -99,7 +126,7 @@ func (r *SchedulingDecisionReconciler) Reconcile(ctx context.Context, req ctrl.R
 		podFound = false
 	}
 
-	decision, ok := buildDecision(&pod, podFound, events)
+	identity, transition, ok := deriveTransition(&pod, podFound, events)
 	if !ok {
 		// Not enough information yet (e.g. the pod hasn't been scheduled or
 		// failed scheduling, and no relevant Event has arrived). A later
@@ -108,43 +135,117 @@ func (r *SchedulingDecisionReconciler) Reconcile(ctx context.Context, req ctrl.R
 		return ctrl.Result{}, nil
 	}
 
-	if podFound {
-		volCtx, err := r.resolveVolumeContext(ctx, &pod)
-		if err != nil {
-			log.Error(err, "resolving volume context", "pod", req.NamespacedName)
-		} else {
-			decision.Spec.VolumeContext = volCtx
-		}
-	}
-
-	if err := r.createIfAbsent(ctx, decision); err != nil {
+	if err := r.recordTransition(ctx, identity, transition, podFound, &pod); err != nil {
 		return ctrl.Result{}, err
 	}
 
 	return ctrl.Result{}, nil
 }
 
-// createIfAbsent creates decision unless a SchedulingDecision already exists
-// for the same Pod UID. Decision names are deterministic
-// (sdec-<pod-uid>), so this check-then-create is race-safe: a concurrent
-// Create from another reconcile of the same Pod UID fails with
-// AlreadyExists, which is treated as success.
-func (r *SchedulingDecisionReconciler) createIfAbsent(
-	ctx context.Context, decision *schedulingv1alpha1.SchedulingDecision,
+// recordTransition makes sure a SchedulingDecision exists for identity.UID,
+// then applies transition to its status. Split this way because the two
+// steps have different idempotency needs: creation only has to happen once
+// per pod, ever, while the status write has to be safe to retry against
+// whatever the object's current state actually is.
+func (r *SchedulingDecisionReconciler) recordTransition(
+	ctx context.Context, identity podIdentity, transition *schedulingv1alpha1.SchedulingTransition,
+	podFound bool, pod *corev1.Pod,
 ) error {
-	existing := &schedulingv1alpha1.SchedulingDecision{}
-	err := r.Get(ctx, types.NamespacedName{Name: decision.Name}, existing)
-	switch {
-	case err == nil:
+	name := decisionName(identity.UID)
+	if err := r.ensureDecisionCreated(ctx, name, identity, podFound, pod); err != nil {
+		return err
+	}
+	return r.appendTransitionWithRetry(ctx, name, transition)
+}
+
+// ensureDecisionCreated creates a SchedulingDecision named name with
+// identity's stable fields as spec, if one doesn't already exist. Decision
+// names are deterministic (sdec-<pod-uid>), so losing a Create race to
+// another reconcile of the same Pod UID is expected and treated as success
+// (AlreadyExists) - the actual status write always happens afterward, in
+// appendTransitionWithRetry, regardless of which path got the decision
+// created.
+func (r *SchedulingDecisionReconciler) ensureDecisionCreated(
+	ctx context.Context, name string, identity podIdentity, podFound bool, pod *corev1.Pod,
+) error {
+	var existing schedulingv1alpha1.SchedulingDecision
+	if err := r.Get(ctx, types.NamespacedName{Name: name}, &existing); err == nil {
 		return nil
-	case apierrors.IsNotFound(err):
-		// fall through to create
-	default:
-		return fmt.Errorf("checking for existing SchedulingDecision %s: %w", decision.Name, err)
+	} else if !apierrors.IsNotFound(err) {
+		return fmt.Errorf("getting SchedulingDecision %s: %w", name, err)
+	}
+
+	log := logf.FromContext(ctx)
+	expiresAt := time.Now().Add(r.retentionWindow()).Unix()
+	decision := &schedulingv1alpha1.SchedulingDecision{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: name,
+			Labels: map[string]string{
+				podUIDLabel:                       string(identity.UID),
+				schedulingv1alpha1.ExpiresAtLabel: strconv.FormatInt(expiresAt, 10),
+			},
+		},
+		Spec: schedulingv1alpha1.SchedulingDecisionSpec{
+			PodName:       identity.Name,
+			PodNamespace:  identity.Namespace,
+			PodUID:        identity.UID,
+			SchedulerName: identity.SchedulerName,
+		},
+	}
+
+	if podFound {
+		volCtx, err := r.resolveVolumeContext(ctx, pod)
+		if err != nil {
+			log.Error(err, "resolving volume context", "pod", types.NamespacedName{
+				Namespace: identity.Namespace, Name: identity.Name,
+			})
+		} else {
+			decision.Spec.VolumeContext = volCtx
+		}
 	}
 
 	if err := r.Create(ctx, decision); err != nil && !apierrors.IsAlreadyExists(err) {
-		return fmt.Errorf("creating SchedulingDecision %s: %w", decision.Name, err)
+		return fmt.Errorf("creating SchedulingDecision %s: %w", name, err)
+	}
+	return nil
+}
+
+// appendTransitionWithRetry appends transition to the named decision's
+// status history and updates its "latest observed outcome" fields, unless
+// transition is identical to the most recently recorded one (a no-op, so
+// re-deriving an already-recorded outcome - e.g. from an unrelated Pod
+// update - doesn't grow the history forever).
+//
+// It re-fetches the decision fresh on every attempt rather than reusing a
+// caller-supplied copy, and retries on a Conflict: the manager's client
+// reads through a local cache, which can still be a step behind a write
+// this same reconciler just made - either ensureDecisionCreated's Create
+// (the Get below can come back NotFound for an object that was already
+// created, if the cache hasn't caught up yet) or this function's own
+// previous attempt (Update can come back Conflict against a resourceVersion
+// that's already stale). Retrying against a fresh read on either error is
+// what makes both cases safe instead of failing the reconcile outright.
+func (r *SchedulingDecisionReconciler) appendTransitionWithRetry(
+	ctx context.Context, name string, transition *schedulingv1alpha1.SchedulingTransition,
+) error {
+	retriable := func(err error) bool {
+		return apierrors.IsConflict(err) || apierrors.IsNotFound(err)
+	}
+	err := retry.OnError(retry.DefaultBackoff, retriable, func() error {
+		decision := &schedulingv1alpha1.SchedulingDecision{}
+		if err := r.Get(ctx, types.NamespacedName{Name: name}, decision); err != nil {
+			return err
+		}
+
+		if n := len(decision.Status.Transitions); n > 0 && transitionsEqual(decision.Status.Transitions[n-1], *transition) {
+			return nil
+		}
+
+		applyTransition(&decision.Status, transition)
+		return r.Status().Update(ctx, decision)
+	})
+	if err != nil {
+		return fmt.Errorf("updating status for SchedulingDecision %s: %w", name, err)
 	}
 	return nil
 }

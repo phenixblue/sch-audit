@@ -1,0 +1,50 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: sweep
+  namespace: system
+  labels:
+    control-plane: sweep
+    app.kubernetes.io/name: sch-audit
+    app.kubernetes.io/managed-by: kustomize
+spec:
+  # Runs far more often than the ~72h default retention window so an
+  # expired SchedulingDecision doesn't linger for long after it ages out;
+  # each run is a cheap List+Delete pass over a cluster-scoped CRD.
+  schedule: "0 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      template:
+        metadata:
+          labels:
+            control-plane: sweep
+            app.kubernetes.io/name: sch-audit
+        spec:
+          restartPolicy: OnFailure
+          securityContext:
+            runAsNonRoot: true
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+          - command:
+            - /sweep
+            image: controller:latest
+            name: sweep
+            securityContext:
+              readOnlyRootFilesystem: true
+              allowPrivilegeEscalation: false
+              capabilities:
+                drop:
+                - "ALL"
+            resources:
+              limits:
+                cpu: 200m
+                memory: 64Mi
+              requests:
+                cpu: 10m
+                memory: 32Mi
+          serviceAccountName: controller-manager

@@ -17,6 +17,7 @@ limitations under the License.
 package controllers
 
 import (
+	"strconv"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -54,14 +55,25 @@ var _ = Describe("SchedulingDecisionReconciler", func() {
 	// bindPod sets spec.nodeName via the pods/binding subresource, the only
 	// way the apiserver allows that field to transition from empty (a plain
 	// Update is rejected as an immutable-field change), then refreshes pod
-	// so later Status().Update calls use a current resourceVersion.
+	// so later Status().Update calls use a current resourceVersion. The
+	// refresh polls rather than doing a single Get: k8sClient reads through
+	// the manager's cache, which can still be a step behind the binding
+	// write for a moment, and a Get that lands in that window would hand
+	// back a resourceVersion that's already stale, making the caller's next
+	// Status().Update conflict.
 	bindPod := func(pod *corev1.Pod, nodeName string) {
 		binding := &corev1.Binding{
 			ObjectMeta: metav1.ObjectMeta{Name: pod.Name, Namespace: pod.Namespace},
 			Target:     corev1.ObjectReference{Kind: "Node", Name: nodeName},
 		}
 		Expect(k8sClient.SubResource("binding").Create(ctx, pod, binding)).To(Succeed())
-		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(pod), pod)).To(Succeed())
+
+		Eventually(func() (string, error) {
+			if err := k8sClient.Get(ctx, client.ObjectKeyFromObject(pod), pod); err != nil {
+				return "", err
+			}
+			return pod.Spec.NodeName, nil
+		}, 5*time.Second, 50*time.Millisecond).Should(Equal(nodeName))
 	}
 
 	setPodScheduledCondition := func(pod *corev1.Pod, status corev1.ConditionStatus, reason, message string) {
@@ -75,11 +87,19 @@ var _ = Describe("SchedulingDecisionReconciler", func() {
 		Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
 	}
 
+	// fetchDecision waits for both the SchedulingDecision to exist and its
+	// status to carry an outcome, not just existence: the controller writes
+	// status via a separate call after creating the object, so there's a
+	// legitimate (if usually brief) window where the object exists but
+	// status is still empty.
 	fetchDecision := func(podUID types.UID) *schedulingv1alpha1.SchedulingDecision {
 		decision := &schedulingv1alpha1.SchedulingDecision{}
-		Eventually(func() error {
-			return k8sClient.Get(ctx, types.NamespacedName{Name: decisionName(podUID)}, decision)
-		}, 5*time.Second, 100*time.Millisecond).Should(Succeed())
+		Eventually(func() (schedulingv1alpha1.SchedulingOutcome, error) {
+			if err := k8sClient.Get(ctx, types.NamespacedName{Name: decisionName(podUID)}, decision); err != nil {
+				return "", err
+			}
+			return decision.Status.Outcome, nil
+		}, 5*time.Second, 100*time.Millisecond).ShouldNot(BeEmpty())
 		return decision
 	}
 
@@ -94,16 +114,27 @@ var _ = Describe("SchedulingDecisionReconciler", func() {
 		decision := fetchDecision(pod.UID)
 		DeferCleanup(func() { _ = k8sClient.Delete(ctx, decision) })
 
-		Expect(decision.Spec.Outcome).To(Equal(schedulingv1alpha1.SchedulingOutcomeScheduled))
-		Expect(decision.Spec.ChosenNode).To(Equal("node-1"))
+		Expect(decision.Status.Outcome).To(Equal(schedulingv1alpha1.SchedulingOutcomeScheduled))
+		Expect(decision.Status.ChosenNode).To(Equal("node-1"))
 		Expect(decision.Spec.PodName).To(Equal(pod.Name))
 		Expect(decision.Spec.PodNamespace).To(Equal(namespace))
 		Expect(decision.Spec.PodUID).To(Equal(pod.UID))
 		Expect(decision.Spec.SchedulerName).To(Equal("default-scheduler")) // pod.Spec.SchedulerName fallback
 		Expect(decision.Labels[podUIDLabel]).To(Equal(string(pod.UID)))
+		Expect(decision.Status.Transitions).To(HaveLen(1))
+
+		// Retention sweep (cmd/sweep) keys off this label: it should be set
+		// to roughly now+DefaultRetentionWindow, not the zero value or some
+		// unrelated timestamp.
+		expiresAt, err := strconv.ParseInt(decision.Labels[schedulingv1alpha1.ExpiresAtLabel], 10, 64)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(time.Unix(expiresAt, 0)).To(BeTemporally(
+			"~", time.Now().Add(DefaultRetentionWindow), 10*time.Second,
+		))
 
 		// Idempotency: forcing another reconcile (via an unrelated update)
-		// must not produce a second decision for the same pod UID.
+		// must not produce a second decision for the same pod UID, nor
+		// append a duplicate transition to the one that exists.
 		pod.Labels = map[string]string{"touch": rand.String(4)}
 		Expect(k8sClient.Update(ctx, pod)).To(Succeed())
 
@@ -113,6 +144,13 @@ var _ = Describe("SchedulingDecisionReconciler", func() {
 				return 0, err
 			}
 			return len(list.Items), nil
+		}, 2*time.Second, 200*time.Millisecond).Should(Equal(1))
+
+		Consistently(func() (int, error) {
+			if err := k8sClient.Get(ctx, client.ObjectKeyFromObject(decision), decision); err != nil {
+				return 0, err
+			}
+			return len(decision.Status.Transitions), nil
 		}, 2*time.Second, 200*time.Millisecond).Should(Equal(1))
 	})
 
@@ -127,9 +165,43 @@ var _ = Describe("SchedulingDecisionReconciler", func() {
 		decision := fetchDecision(pod.UID)
 		DeferCleanup(func() { _ = k8sClient.Delete(ctx, decision) })
 
-		Expect(decision.Spec.Outcome).To(Equal(schedulingv1alpha1.SchedulingOutcomeFailedScheduling))
-		Expect(decision.Spec.ChosenNode).To(BeEmpty())
-		Expect(decision.Spec.ReasonSummary).To(Equal(failureMessage))
+		Expect(decision.Status.Outcome).To(Equal(schedulingv1alpha1.SchedulingOutcomeFailedScheduling))
+		Expect(decision.Status.ChosenNode).To(BeEmpty())
+		Expect(decision.Status.ReasonSummary).To(Equal(failureMessage))
+	})
+
+	It("supersedes a transient FailedScheduling once the pod actually gets Scheduled", func() {
+		// Reproduces the retry-loop a scheduler goes through against a PVC
+		// with an Immediate VolumeBindingMode: it reports FailedScheduling
+		// while the PVC is still being provisioned, then Scheduled once the
+		// PVC binds and it retries. The first observation must not be the
+		// permanent record.
+		pod := newPod(uniqueName("retry-pod"))
+		Expect(k8sClient.Create(ctx, pod)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, pod) })
+
+		const transientMessage = "0/6 nodes are available: pod has unbound immediate PersistentVolumeClaims."
+		setPodScheduledCondition(pod, corev1.ConditionFalse, "Unschedulable", transientMessage)
+
+		decision := fetchDecision(pod.UID)
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, decision) })
+		Expect(decision.Status.Outcome).To(Equal(schedulingv1alpha1.SchedulingOutcomeFailedScheduling))
+		Expect(decision.Status.Transitions).To(HaveLen(1))
+
+		bindPod(pod, "node-1")
+		setPodScheduledCondition(pod, corev1.ConditionTrue, "", "")
+
+		Eventually(func() (schedulingv1alpha1.SchedulingOutcome, error) {
+			if err := k8sClient.Get(ctx, client.ObjectKeyFromObject(decision), decision); err != nil {
+				return "", err
+			}
+			return decision.Status.Outcome, nil
+		}, 5*time.Second, 100*time.Millisecond).Should(Equal(schedulingv1alpha1.SchedulingOutcomeScheduled))
+
+		Expect(decision.Status.ChosenNode).To(Equal("node-1"))
+		Expect(decision.Status.Transitions).To(HaveLen(2))
+		Expect(decision.Status.Transitions[0].Outcome).To(Equal(schedulingv1alpha1.SchedulingOutcomeFailedScheduling))
+		Expect(decision.Status.Transitions[1].Outcome).To(Equal(schedulingv1alpha1.SchedulingOutcomeScheduled))
 	})
 
 	It("records a Preempted decision from an Event when the pod still exists", func() {
@@ -156,10 +228,11 @@ var _ = Describe("SchedulingDecisionReconciler", func() {
 		decision := fetchDecision(pod.UID)
 		DeferCleanup(func() { _ = k8sClient.Delete(ctx, decision) })
 
-		Expect(decision.Spec.Outcome).To(Equal(schedulingv1alpha1.SchedulingOutcomePreempted))
-		Expect(decision.Spec.ReasonSummary).To(Equal(event.Message))
+		Expect(decision.Status.Outcome).To(Equal(schedulingv1alpha1.SchedulingOutcomePreempted))
+		Expect(decision.Status.ReasonSummary).To(Equal(event.Message))
 		Expect(decision.Spec.SchedulerName).To(Equal("default-scheduler"))
-		Expect(decision.Spec.SourceRef.EventUID).To(Equal(event.UID))
+		Expect(decision.Status.Transitions).To(HaveLen(1))
+		Expect(decision.Status.Transitions[0].SourceRef.EventUID).To(Equal(event.UID))
 	})
 
 	It("records a Preempted decision from an Event even after the pod is gone", func() {
@@ -186,7 +259,7 @@ var _ = Describe("SchedulingDecisionReconciler", func() {
 		decision := fetchDecision(podUID)
 		DeferCleanup(func() { _ = k8sClient.Delete(ctx, decision) })
 
-		Expect(decision.Spec.Outcome).To(Equal(schedulingv1alpha1.SchedulingOutcomePreempted))
+		Expect(decision.Status.Outcome).To(Equal(schedulingv1alpha1.SchedulingOutcomePreempted))
 		Expect(decision.Spec.PodName).To(Equal(pod.Name))
 		Expect(decision.Spec.PodNamespace).To(Equal(namespace))
 		Expect(decision.Spec.PodUID).To(Equal(podUID))

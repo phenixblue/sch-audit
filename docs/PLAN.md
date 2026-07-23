@@ -141,3 +141,33 @@ sch-audit/
   cluster-scoped for v1.
 - Export sink for cold storage (Loki vs Elasticsearch vs S3) — deferred
   until Tier 1 is validated and volume/retention needs are clearer.
+
+## Design revisions
+
+**2026-07-22 — spec/status split, transition history.** The original CRD
+design above treated a `SchedulingDecision` as a single immutable write-once
+record (everything under `.spec`, no status subresource). Validating against
+a real OpenShift cluster running STORK + Portworx (Milestone 5, pulled
+forward) showed this was wrong: a StorageClass with `Immediate`
+`volumeBindingMode` makes STORK (and any scheduler) report a transient
+`FailedScheduling` ("pod has unbound immediate PersistentVolumeClaims")
+while the PVC is still provisioning, then `Scheduled` once it binds and the
+scheduler retries. Under the original design, the reconciler committed
+whichever outcome it observed first and never revisited it, so retried pods
+were permanently misrecorded as failed even though they were actually
+running.
+
+The CRD was revised so `.spec` holds only what's stable for a pod's whole
+lifetime (`podName`, `podNamespace`, `podUID`, `schedulerName`,
+`volumeContext`) and is set once, while a new `.status` subresource holds the
+latest observed outcome (`outcome`, `chosenNode`, `reasonSummary`,
+`decisionTimestamp`, `schedulingLatencyMs`) plus `status.transitions[]`, an
+ordered history of every observed outcome for the pod. The reconciler now
+appends a transition whenever it observes a new outcome instead of writing
+once and never touching the record again; a retry loop or a
+preempted-after-scheduled sequence shows up as multiple transitions rather
+than silently overwriting or freezing on the wrong one. `candidateNodes` and
+`sourceRef` moved from top-level spec fields to per-transition fields, since
+they describe a single scheduling attempt, not the pod as a whole. Printer
+columns for Node/Outcome/LatencyMs now read from `.status` instead of
+`.spec`.

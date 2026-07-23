@@ -85,11 +85,12 @@ type VolumeContext struct {
 	TopologyConstraint string `json:"topologyConstraint,omitempty"`
 }
 
-// SourceRef links a SchedulingDecision back to the Kubernetes objects it was
-// reconstructed from, for cross-referencing with other observability data.
+// SourceRef links a SchedulingDecision transition back to the Kubernetes
+// objects it was reconstructed from, for cross-referencing with other
+// observability data.
 type SourceRef struct {
-	// eventUID is the UID of the Kubernetes Event this decision was derived
-	// from, if any.
+	// eventUID is the UID of the Kubernetes Event this transition was
+	// derived from, if any.
 	// +optional
 	EventUID types.UID `json:"eventUID,omitempty"`
 
@@ -99,39 +100,54 @@ type SourceRef struct {
 	AuditRequestID string `json:"auditRequestID,omitempty"`
 }
 
-// SchedulingDecisionSpec records a single scheduling decision. A
-// SchedulingDecision is an immutable log entry, not a reconciled object: it
-// is written once when the decision is observed and never updated
-// afterward.
+// SchedulingDecisionSpec identifies the pod a SchedulingDecision is about and
+// the context that's stable for that pod's whole lifetime (the scheduler
+// acting on it, its volume plumbing). It's set once when the first
+// transition for the pod is observed and never updated afterward — anything
+// that can change as scheduling is retried or re-observed (outcome, chosen
+// node, reason) lives in status instead, since a scheduler can legitimately
+// revise its own outcome for the same pod (e.g. a transient FailedScheduling
+// while a PVC is still binding, followed by a Scheduled once it does).
 type SchedulingDecisionSpec struct {
-	// podName is the name of the pod that was scheduled.
+	// podName is the name of the pod this decision is about.
 	// +required
 	PodName string `json:"podName"`
 
-	// podNamespace is the namespace of the pod that was scheduled.
+	// podNamespace is the namespace of the pod this decision is about.
 	// +required
 	PodNamespace string `json:"podNamespace"`
 
-	// podUID is the UID of the pod that was scheduled. Used as the
-	// idempotency key so a given pod bind produces at most one
+	// podUID is the UID of the pod this decision is about. Used to derive
+	// the SchedulingDecision's name, so a given pod maps to at most one
 	// SchedulingDecision.
 	// +required
 	PodUID types.UID `json:"podUID"`
 
-	// schedulerName is the scheduler that made this decision (e.g.
+	// schedulerName is the scheduler acting on this pod (e.g.
 	// default-scheduler, stork), taken from the reporting component of the
 	// source Event.
 	// +optional
 	SchedulerName string `json:"schedulerName,omitempty"`
 
+	// volumeContext describes the volume plumbing that influences
+	// placement, if the pod references a PVC.
+	// +optional
+	VolumeContext *VolumeContext `json:"volumeContext,omitempty"`
+}
+
+// SchedulingTransition records a single observed scheduling outcome for a
+// pod, in the order the reconciler observed it. A retry loop (e.g.
+// FailedScheduling while a PVC binds, followed by Scheduled) or a preemption
+// after an earlier successful schedule both show up as separate entries.
+type SchedulingTransition struct {
+	// outcome is the result of this scheduling attempt.
+	// +required
+	Outcome SchedulingOutcome `json:"outcome"`
+
 	// chosenNode is the node the pod was bound to. Empty for
 	// FailedScheduling outcomes.
 	// +optional
 	ChosenNode string `json:"chosenNode,omitempty"`
-
-	// outcome is the terminal result of the scheduling attempt.
-	// +required
-	Outcome SchedulingOutcome `json:"outcome"`
 
 	// reasonSummary is a short human-readable explanation of the outcome,
 	// taken from the source Event message (e.g. the predicate-failure
@@ -139,46 +155,78 @@ type SchedulingDecisionSpec struct {
 	// +optional
 	ReasonSummary string `json:"reasonSummary,omitempty"`
 
-	// decisionTimestamp is when the scheduling decision was made.
+	// decisionTimestamp is when this transition was observed.
 	// +required
 	DecisionTimestamp metav1.Time `json:"decisionTimestamp"`
 
 	// schedulingLatencyMs is the time in milliseconds between pod creation
-	// and this decision.
+	// and this transition.
 	// +optional
 	SchedulingLatencyMs int64 `json:"schedulingLatencyMs,omitempty"`
 
-	// candidateNodes lists nodes considered during scheduling. Populated
-	// with the rejected-node/reason pairs available from Tier 1
+	// candidateNodes lists nodes considered during this scheduling attempt.
+	// Populated with the rejected-node/reason pairs available from Tier 1
 	// reconstruction; scores are Tier 2 only.
 	// +optional
 	// +listType=atomic
 	CandidateNodes []CandidateNode `json:"candidateNodes,omitempty"`
 
-	// volumeContext describes the volume plumbing that influenced
-	// placement, if the pod referenced a PVC.
-	// +optional
-	VolumeContext *VolumeContext `json:"volumeContext,omitempty"`
-
-	// sourceRef links this decision back to the Kubernetes objects it was
+	// sourceRef links this transition back to the Kubernetes objects it was
 	// reconstructed from.
 	// +optional
 	SourceRef SourceRef `json:"sourceRef,omitempty"`
 }
 
+// SchedulingDecisionStatus reports the most recently observed scheduling
+// outcome for the pod, mirrored from the last entry of transitions, plus the
+// full transition history that produced it.
+type SchedulingDecisionStatus struct {
+	// outcome is the result of the most recently observed transition.
+	// +optional
+	Outcome SchedulingOutcome `json:"outcome,omitempty"`
+
+	// chosenNode is the node the pod was bound to as of the most recently
+	// observed transition. Empty when that transition isn't Scheduled.
+	// +optional
+	ChosenNode string `json:"chosenNode,omitempty"`
+
+	// reasonSummary is the reasonSummary of the most recently observed
+	// transition.
+	// +optional
+	ReasonSummary string `json:"reasonSummary,omitempty"`
+
+	// decisionTimestamp is the decisionTimestamp of the most recently
+	// observed transition.
+	// +optional
+	DecisionTimestamp metav1.Time `json:"decisionTimestamp,omitempty"`
+
+	// schedulingLatencyMs is the schedulingLatencyMs of the most recently
+	// observed transition.
+	// +optional
+	SchedulingLatencyMs int64 `json:"schedulingLatencyMs,omitempty"`
+
+	// transitions is the ordered history of every scheduling outcome
+	// observed for this pod, oldest first.
+	// +optional
+	// +listType=atomic
+	Transitions []SchedulingTransition `json:"transitions,omitempty"`
+}
+
 // +kubebuilder:object:root=true
+// +kubebuilder:subresource:status
 // +kubebuilder:resource:scope=Cluster,shortName=sdec
 // +kubebuilder:printcolumn:name="Pod",type=string,JSONPath=`.spec.podName`
 // +kubebuilder:printcolumn:name="Scheduler",type=string,JSONPath=`.spec.schedulerName`
-// +kubebuilder:printcolumn:name="Node",type=string,JSONPath=`.spec.chosenNode`
+// +kubebuilder:printcolumn:name="Node",type=string,JSONPath=`.status.chosenNode`
 // +kubebuilder:printcolumn:name="VolumeDriver",type=string,JSONPath=`.spec.volumeContext.driverType`
-// +kubebuilder:printcolumn:name="Outcome",type=string,JSONPath=`.spec.outcome`
-// +kubebuilder:printcolumn:name="LatencyMs",type=integer,JSONPath=`.spec.schedulingLatencyMs`
+// +kubebuilder:printcolumn:name="Outcome",type=string,JSONPath=`.status.outcome`
+// +kubebuilder:printcolumn:name="LatencyMs",type=integer,JSONPath=`.status.schedulingLatencyMs`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 
-// SchedulingDecision is a durable, queryable record of a single Kubernetes
-// scheduling decision. It is cluster-scoped and treated as an immutable log
-// entry: once created, it is not reconciled or updated in place.
+// SchedulingDecision is a durable, queryable record of Kubernetes scheduling
+// activity for a single pod. It is cluster-scoped; spec identifies the pod
+// and is set once, while status holds the latest observed outcome plus the
+// full history of transitions that produced it.
 type SchedulingDecision struct {
 	metav1.TypeMeta `json:",inline"`
 
@@ -186,9 +234,13 @@ type SchedulingDecision struct {
 	// +optional
 	metav1.ObjectMeta `json:"metadata,omitzero"`
 
-	// spec records the scheduling decision.
+	// spec identifies the pod this decision is about.
 	// +required
 	Spec SchedulingDecisionSpec `json:"spec"`
+
+	// status reports the latest observed outcome and its full history.
+	// +optional
+	Status SchedulingDecisionStatus `json:"status,omitzero"`
 }
 
 // +kubebuilder:object:root=true

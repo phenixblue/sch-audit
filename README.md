@@ -13,7 +13,9 @@ controller that watches Pod bindings and scheduling Events, denormalizes each
 decision (scheduler identity, chosen node, volume/storage-class context,
 scheduling latency, failure reasons) into a `SchedulingDecision` custom
 resource, and keeps it around long after the source Pod and Events are gone.
-See [docs/PLAN.md](docs/PLAN.md) for the full design and roadmap.
+See [docs/PLAN.md](docs/PLAN.md) for the full design and roadmap. For a
+quick local dev loop against KinD or an existing cluster, see
+[docs/local-testing.md](docs/local-testing.md).
 
 ## Getting Started
 

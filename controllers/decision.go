@@ -27,11 +27,22 @@ import (
 	schedulingv1alpha1 "github.com/phenixblue/sch-audit/api/v1alpha1"
 )
 
-// buildDecision derives a SchedulingDecision from the current Pod (if it
-// still exists) and the Events observed for it. The second return value is
-// false when there isn't yet enough information to record a decision (the
-// pod is still pending with no failure or Preempted Event), in which case
-// the caller should wait for a later reconcile.
+// podIdentity is the subset of a SchedulingDecision's spec that identifies
+// the pod it's about. It's derived once, from whichever transition is
+// observed first for a pod, and never recomputed afterward.
+type podIdentity struct {
+	UID           types.UID
+	Name          string
+	Namespace     string
+	SchedulerName string
+}
+
+// deriveTransition inspects the current Pod and its Events to determine the
+// pod's identity and the latest SchedulingTransition they imply. ok is false
+// when there isn't yet enough information to describe a transition (the pod
+// is still pending with no failure or Preempted Event); a later reconcile,
+// triggered by the Pod's status changing or a relevant Event arriving, picks
+// this back up.
 //
 // candidateNodes (per-node filter results and Tier 2 scores) is
 // intentionally left unpopulated here: the default scheduler's
@@ -39,33 +50,33 @@ import (
 // nodes, not a per-node breakdown, so reasonSummary is the highest-fidelity
 // Tier 1 signal available. Real per-node data is a Tier 2 (scheduling
 // framework hook) concern.
-func buildDecision(
+func deriveTransition(
 	pod *corev1.Pod, podFound bool, events []corev1.Event,
-) (*schedulingv1alpha1.SchedulingDecision, bool) {
+) (podIdentity, *schedulingv1alpha1.SchedulingTransition, bool) {
 	// Preemption has no Pod-status equivalent, and can be the only signal
 	// left once a victim Pod is terminated - so it's checked first and
 	// independently of whether the Pod still exists.
 	if preempted := latestEventWithReason(events, eventReasonPreempted); preempted != nil {
-		return decisionFromPreemption(pod, podFound, preempted), true
+		return identityAndTransitionFromPreemption(pod, podFound, preempted)
 	}
 
 	if !podFound {
 		// Without a live Pod, only a Preempted Event (handled above) carries
 		// enough context (it retains the involved object's identity) to
-		// reconstruct a decision. Scheduled/FailedScheduling need pod.Spec
+		// reconstruct a transition. Scheduled/FailedScheduling need pod.Spec
 		// for scheduler/volume attribution.
-		return nil, false
+		return podIdentity{}, nil, false
 	}
 
 	if cond := podScheduledCondition(pod); cond != nil {
 		switch cond.Status {
 		case corev1.ConditionTrue:
 			evt := latestEventWithReason(events, eventReasonScheduled)
-			return decisionFromScheduled(pod, cond, evt), true
+			return identityFromPod(pod, evt), transitionFromScheduled(pod, cond, evt), true
 		case corev1.ConditionFalse:
 			if cond.Reason == "Unschedulable" {
 				evt := latestEventWithReason(events, eventReasonFailedScheduling)
-				return decisionFromFailedScheduling(pod, cond, evt), true
+				return identityFromPod(pod, evt), transitionFromFailedScheduling(pod, cond, evt), true
 			}
 		case corev1.ConditionUnknown:
 			// Fall through to the Event-only fallback below.
@@ -75,89 +86,111 @@ func buildDecision(
 	// The PodScheduled condition hasn't synced to the cache yet (or wasn't
 	// conclusive); fall back to whatever the Event informer already has.
 	if evt := latestEventWithReason(events, eventReasonScheduled); evt != nil {
-		return decisionFromScheduled(pod, nil, evt), true
+		return identityFromPod(pod, evt), transitionFromScheduled(pod, nil, evt), true
 	}
 	if evt := latestEventWithReason(events, eventReasonFailedScheduling); evt != nil {
-		return decisionFromFailedScheduling(pod, nil, evt), true
+		return identityFromPod(pod, evt), transitionFromFailedScheduling(pod, nil, evt), true
 	}
 
-	return nil, false
+	return podIdentity{}, nil, false
 }
 
-func decisionFromScheduled(
-	pod *corev1.Pod, cond *corev1.PodCondition, event *corev1.Event,
-) *schedulingv1alpha1.SchedulingDecision {
-	ts := decisionTimestamp(cond, event)
-
-	d := newDecision(pod.UID, pod.Name, pod.Namespace, schedulingv1alpha1.SchedulingOutcomeScheduled, ts)
-	d.Spec.ChosenNode = pod.Spec.NodeName
-	d.Spec.ReasonSummary = firstNonEmpty(conditionMessage(cond), eventMessage(event))
-	d.Spec.SchedulerName = schedulerNameFor(event, pod, true)
-	if event != nil {
-		d.Spec.SourceRef.EventUID = event.UID
+func identityFromPod(pod *corev1.Pod, event *corev1.Event) podIdentity {
+	return podIdentity{
+		UID:           pod.UID,
+		Name:          pod.Name,
+		Namespace:     pod.Namespace,
+		SchedulerName: schedulerNameFor(event, pod, true),
 	}
-	d.Spec.SchedulingLatencyMs = latencyMs(pod.CreationTimestamp.Time, ts.Time)
-	return d
 }
 
-func decisionFromFailedScheduling(
-	pod *corev1.Pod, cond *corev1.PodCondition, event *corev1.Event,
-) *schedulingv1alpha1.SchedulingDecision {
-	ts := decisionTimestamp(cond, event)
-
-	d := newDecision(pod.UID, pod.Name, pod.Namespace, schedulingv1alpha1.SchedulingOutcomeFailedScheduling, ts)
-	d.Spec.ReasonSummary = firstNonEmpty(conditionMessage(cond), eventMessage(event))
-	d.Spec.SchedulerName = schedulerNameFor(event, pod, true)
-	if event != nil {
-		d.Spec.SourceRef.EventUID = event.UID
-	}
-	d.Spec.SchedulingLatencyMs = latencyMs(pod.CreationTimestamp.Time, ts.Time)
-	return d
-}
-
-func decisionFromPreemption(
+func identityAndTransitionFromPreemption(
 	pod *corev1.Pod, podFound bool, event *corev1.Event,
-) *schedulingv1alpha1.SchedulingDecision {
+) (podIdentity, *schedulingv1alpha1.SchedulingTransition, bool) {
 	ts := metav1.NewTime(eventTimestamp(*event))
 
-	var uid types.UID
-	var name, namespace string
+	identity := podIdentity{SchedulerName: schedulerNameFor(event, pod, podFound)}
 	if podFound {
-		uid, name, namespace = pod.UID, pod.Name, pod.Namespace
+		identity.UID, identity.Name, identity.Namespace = pod.UID, pod.Name, pod.Namespace
 	} else {
-		uid, name, namespace = event.InvolvedObject.UID, event.InvolvedObject.Name, event.InvolvedObject.Namespace
+		identity.UID = event.InvolvedObject.UID
+		identity.Name = event.InvolvedObject.Name
+		identity.Namespace = event.InvolvedObject.Namespace
 	}
 
-	d := newDecision(uid, name, namespace, schedulingv1alpha1.SchedulingOutcomePreempted, ts)
-	d.Spec.ReasonSummary = event.Message
-	d.Spec.SchedulerName = schedulerNameFor(event, pod, podFound)
-	d.Spec.SourceRef.EventUID = event.UID
+	t := newTransition(schedulingv1alpha1.SchedulingOutcomePreempted, ts)
+	t.ReasonSummary = event.Message
+	t.SourceRef.EventUID = event.UID
 	if podFound {
-		d.Spec.SchedulingLatencyMs = latencyMs(pod.CreationTimestamp.Time, ts.Time)
+		t.SchedulingLatencyMs = latencyMs(pod.CreationTimestamp.Time, ts.Time)
 	}
-	return d
+	return identity, t, true
 }
 
-func newDecision(
-	podUID types.UID, podName, podNamespace string, outcome schedulingv1alpha1.SchedulingOutcome, ts metav1.Time,
-) *schedulingv1alpha1.SchedulingDecision {
-	return &schedulingv1alpha1.SchedulingDecision{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:   decisionName(podUID),
-			Labels: map[string]string{podUIDLabel: string(podUID)},
-		},
-		Spec: schedulingv1alpha1.SchedulingDecisionSpec{
-			PodName:           podName,
-			PodNamespace:      podNamespace,
-			PodUID:            podUID,
-			Outcome:           outcome,
-			DecisionTimestamp: ts,
-		},
+func transitionFromScheduled(
+	pod *corev1.Pod, cond *corev1.PodCondition, event *corev1.Event,
+) *schedulingv1alpha1.SchedulingTransition {
+	ts := decisionTimestamp(cond, event)
+
+	t := newTransition(schedulingv1alpha1.SchedulingOutcomeScheduled, ts)
+	t.ChosenNode = pod.Spec.NodeName
+	t.ReasonSummary = firstNonEmpty(conditionMessage(cond), eventMessage(event))
+	if event != nil {
+		t.SourceRef.EventUID = event.UID
+	}
+	t.SchedulingLatencyMs = latencyMs(pod.CreationTimestamp.Time, ts.Time)
+	return t
+}
+
+func transitionFromFailedScheduling(
+	pod *corev1.Pod, cond *corev1.PodCondition, event *corev1.Event,
+) *schedulingv1alpha1.SchedulingTransition {
+	ts := decisionTimestamp(cond, event)
+
+	t := newTransition(schedulingv1alpha1.SchedulingOutcomeFailedScheduling, ts)
+	t.ReasonSummary = firstNonEmpty(conditionMessage(cond), eventMessage(event))
+	if event != nil {
+		t.SourceRef.EventUID = event.UID
+	}
+	t.SchedulingLatencyMs = latencyMs(pod.CreationTimestamp.Time, ts.Time)
+	return t
+}
+
+func newTransition(
+	outcome schedulingv1alpha1.SchedulingOutcome, ts metav1.Time,
+) *schedulingv1alpha1.SchedulingTransition {
+	return &schedulingv1alpha1.SchedulingTransition{
+		Outcome:           outcome,
+		DecisionTimestamp: ts,
 	}
 }
 
 func decisionName(podUID types.UID) string {
 	return fmt.Sprintf("sdec-%s", podUID)
+}
+
+// applyTransition appends transition to status's history and mirrors it
+// into status's "latest observed outcome" fields.
+func applyTransition(
+	status *schedulingv1alpha1.SchedulingDecisionStatus, transition *schedulingv1alpha1.SchedulingTransition,
+) {
+	status.Transitions = append(status.Transitions, *transition)
+	status.Outcome = transition.Outcome
+	status.ChosenNode = transition.ChosenNode
+	status.ReasonSummary = transition.ReasonSummary
+	status.DecisionTimestamp = transition.DecisionTimestamp
+	status.SchedulingLatencyMs = transition.SchedulingLatencyMs
+}
+
+// transitionsEqual reports whether two transitions represent the same
+// observed outcome, so a reconcile that re-derives an already-recorded
+// transition (e.g. triggered by an unrelated pod update) is a no-op instead
+// of appending a duplicate.
+func transitionsEqual(a, b schedulingv1alpha1.SchedulingTransition) bool {
+	return a.Outcome == b.Outcome &&
+		a.ChosenNode == b.ChosenNode &&
+		a.ReasonSummary == b.ReasonSummary &&
+		a.DecisionTimestamp.Equal(&b.DecisionTimestamp)
 }
 
 // schedulerNameFor prefers the reporting scheduler recorded on the Event

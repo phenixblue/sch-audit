@@ -23,16 +23,16 @@ spec:
     - jsonPath: .spec.schedulerName
       name: Scheduler
       type: string
-    - jsonPath: .spec.chosenNode
+    - jsonPath: .status.chosenNode
       name: Node
       type: string
     - jsonPath: .spec.volumeContext.driverType
       name: VolumeDriver
       type: string
-    - jsonPath: .spec.outcome
+    - jsonPath: .status.outcome
       name: Outcome
       type: string
-    - jsonPath: .spec.schedulingLatencyMs
+    - jsonPath: .status.schedulingLatencyMs
       name: LatencyMs
       type: integer
     - jsonPath: .metadata.creationTimestamp
@@ -42,9 +42,10 @@ spec:
     schema:
       openAPIV3Schema:
         description: |-
-          SchedulingDecision is a durable, queryable record of a single Kubernetes
-          scheduling decision. It is cluster-scoped and treated as an immutable log
-          entry: once created, it is not reconciled or updated in place.
+          SchedulingDecision is a durable, queryable record of Kubernetes scheduling
+          activity for a single pod. It is cluster-scoped; spec identifies the pod
+          and is set once, while status holds the latest observed outcome plus the
+          full history of transitions that produced it.
         properties:
           apiVersion:
             description: |-
@@ -64,106 +65,31 @@ spec:
           metadata:
             type: object
           spec:
-            description: spec records the scheduling decision.
+            description: spec identifies the pod this decision is about.
             properties:
-              candidateNodes:
-                description: |-
-                  candidateNodes lists nodes considered during scheduling. Populated
-                  with the rejected-node/reason pairs available from Tier 1
-                  reconstruction; scores are Tier 2 only.
-                items:
-                  description: |-
-                    CandidateNode captures the fate of a single node considered during a
-                    scheduling attempt. Score is only populated by Tier 2 (scheduling
-                    framework hook) capture; Tier 1 reconstruction from Events cannot see
-                    per-node scores for nodes that passed filtering.
-                  properties:
-                    filterResult:
-                      description: |-
-                        filterResult is the predicate-failure string reported for this node,
-                        if the node was rejected during filtering.
-                      type: string
-                    name:
-                      description: name is the node name.
-                      type: string
-                    score:
-                      description: |-
-                        score is the node's score at decision time. Only populated by Tier 2
-                        capture.
-                      format: int64
-                      type: integer
-                  required:
-                  - name
-                  type: object
-                type: array
-                x-kubernetes-list-type: atomic
-              chosenNode:
-                description: |-
-                  chosenNode is the node the pod was bound to. Empty for
-                  FailedScheduling outcomes.
-                type: string
-              decisionTimestamp:
-                description: decisionTimestamp is when the scheduling decision was
-                  made.
-                format: date-time
-                type: string
-              outcome:
-                description: outcome is the terminal result of the scheduling attempt.
-                enum:
-                - Scheduled
-                - FailedScheduling
-                - Preempted
-                type: string
               podName:
-                description: podName is the name of the pod that was scheduled.
+                description: podName is the name of the pod this decision is about.
                 type: string
               podNamespace:
-                description: podNamespace is the namespace of the pod that was scheduled.
+                description: podNamespace is the namespace of the pod this decision
+                  is about.
                 type: string
               podUID:
                 description: |-
-                  podUID is the UID of the pod that was scheduled. Used as the
-                  idempotency key so a given pod bind produces at most one
+                  podUID is the UID of the pod this decision is about. Used to derive
+                  the SchedulingDecision's name, so a given pod maps to at most one
                   SchedulingDecision.
-                type: string
-              reasonSummary:
-                description: |-
-                  reasonSummary is a short human-readable explanation of the outcome,
-                  taken from the source Event message (e.g. the predicate-failure
-                  string for FailedScheduling).
                 type: string
               schedulerName:
                 description: |-
-                  schedulerName is the scheduler that made this decision (e.g.
+                  schedulerName is the scheduler acting on this pod (e.g.
                   default-scheduler, stork), taken from the reporting component of the
                   source Event.
                 type: string
-              schedulingLatencyMs:
-                description: |-
-                  schedulingLatencyMs is the time in milliseconds between pod creation
-                  and this decision.
-                format: int64
-                type: integer
-              sourceRef:
-                description: |-
-                  sourceRef links this decision back to the Kubernetes objects it was
-                  reconstructed from.
-                properties:
-                  auditRequestID:
-                    description: |-
-                      auditRequestID is the audit-id of the API request that performed the
-                      bind, if it could be correlated.
-                    type: string
-                  eventUID:
-                    description: |-
-                      eventUID is the UID of the Kubernetes Event this decision was derived
-                      from, if any.
-                    type: string
-                type: object
               volumeContext:
                 description: |-
-                  volumeContext describes the volume plumbing that influenced
-                  placement, if the pod referenced a PVC.
+                  volumeContext describes the volume plumbing that influences
+                  placement, if the pod references a PVC.
                 properties:
                   bindingMode:
                     description: |-
@@ -191,15 +117,139 @@ spec:
                     type: string
                 type: object
             required:
-            - decisionTimestamp
-            - outcome
             - podName
             - podNamespace
             - podUID
+            type: object
+          status:
+            description: status reports the latest observed outcome and its full history.
+            properties:
+              chosenNode:
+                description: |-
+                  chosenNode is the node the pod was bound to as of the most recently
+                  observed transition. Empty when that transition isn't Scheduled.
+                type: string
+              decisionTimestamp:
+                description: |-
+                  decisionTimestamp is the decisionTimestamp of the most recently
+                  observed transition.
+                format: date-time
+                type: string
+              outcome:
+                description: outcome is the result of the most recently observed transition.
+                enum:
+                - Scheduled
+                - FailedScheduling
+                - Preempted
+                type: string
+              reasonSummary:
+                description: |-
+                  reasonSummary is the reasonSummary of the most recently observed
+                  transition.
+                type: string
+              schedulingLatencyMs:
+                description: |-
+                  schedulingLatencyMs is the schedulingLatencyMs of the most recently
+                  observed transition.
+                format: int64
+                type: integer
+              transitions:
+                description: |-
+                  transitions is the ordered history of every scheduling outcome
+                  observed for this pod, oldest first.
+                items:
+                  description: |-
+                    SchedulingTransition records a single observed scheduling outcome for a
+                    pod, in the order the reconciler observed it. A retry loop (e.g.
+                    FailedScheduling while a PVC binds, followed by Scheduled) or a preemption
+                    after an earlier successful schedule both show up as separate entries.
+                  properties:
+                    candidateNodes:
+                      description: |-
+                        candidateNodes lists nodes considered during this scheduling attempt.
+                        Populated with the rejected-node/reason pairs available from Tier 1
+                        reconstruction; scores are Tier 2 only.
+                      items:
+                        description: |-
+                          CandidateNode captures the fate of a single node considered during a
+                          scheduling attempt. Score is only populated by Tier 2 (scheduling
+                          framework hook) capture; Tier 1 reconstruction from Events cannot see
+                          per-node scores for nodes that passed filtering.
+                        properties:
+                          filterResult:
+                            description: |-
+                              filterResult is the predicate-failure string reported for this node,
+                              if the node was rejected during filtering.
+                            type: string
+                          name:
+                            description: name is the node name.
+                            type: string
+                          score:
+                            description: |-
+                              score is the node's score at decision time. Only populated by Tier 2
+                              capture.
+                            format: int64
+                            type: integer
+                        required:
+                        - name
+                        type: object
+                      type: array
+                      x-kubernetes-list-type: atomic
+                    chosenNode:
+                      description: |-
+                        chosenNode is the node the pod was bound to. Empty for
+                        FailedScheduling outcomes.
+                      type: string
+                    decisionTimestamp:
+                      description: decisionTimestamp is when this transition was observed.
+                      format: date-time
+                      type: string
+                    outcome:
+                      description: outcome is the result of this scheduling attempt.
+                      enum:
+                      - Scheduled
+                      - FailedScheduling
+                      - Preempted
+                      type: string
+                    reasonSummary:
+                      description: |-
+                        reasonSummary is a short human-readable explanation of the outcome,
+                        taken from the source Event message (e.g. the predicate-failure
+                        string for FailedScheduling).
+                      type: string
+                    schedulingLatencyMs:
+                      description: |-
+                        schedulingLatencyMs is the time in milliseconds between pod creation
+                        and this transition.
+                      format: int64
+                      type: integer
+                    sourceRef:
+                      description: |-
+                        sourceRef links this transition back to the Kubernetes objects it was
+                        reconstructed from.
+                      properties:
+                        auditRequestID:
+                          description: |-
+                            auditRequestID is the audit-id of the API request that performed the
+                            bind, if it could be correlated.
+                          type: string
+                        eventUID:
+                          description: |-
+                            eventUID is the UID of the Kubernetes Event this transition was
+                            derived from, if any.
+                          type: string
+                      type: object
+                  required:
+                  - decisionTimestamp
+                  - outcome
+                  type: object
+                type: array
+                x-kubernetes-list-type: atomic
             type: object
         required:
         - spec
         type: object
     served: true
     storage: true
-    subresources: {}
+    subresources:
+      status: {}
