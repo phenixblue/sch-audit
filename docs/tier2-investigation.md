@@ -117,3 +117,53 @@ it can attach to. That's real, currently-missing information Tier 1 can't
 produce from Events alone, and needs no custom scheduler build. It still
 wouldn't include `candidateNodes[].score`, since that's exactly the data an
 extender never sees.
+
+## Addendum: API / metrics / log scraping, checked directly
+
+A natural follow-up: is there some *other*, non-plugin way to observe
+per-node scores — the Kubernetes API, a metrics endpoint, or log scraping?
+Checked each against the live cluster and current upstream docs; all three
+are dead ends for this specific question.
+
+- **API**: no dedicated object exists anywhere in stock Kubernetes for
+  scheduling internals. Events are the only audit-trail-shaped surface, and
+  (as above) a `FailedScheduling` Event is one aggregate string, not a
+  per-node breakdown.
+
+- **Metrics**: attempted to scrape `stork-scheduler`'s own `/metrics`
+  (it's the stock kube-scheduler binary, so identical metric set to
+  default-scheduler) but hit an RBAC delegation error on the auth check —
+  moot regardless, since the metric *names* already rule this out. The
+  relevant histograms, `scheduler_framework_extension_point_duration_seconds`
+  and `scheduler_plugin_execution_duration_seconds`, are labeled only by
+  `plugin`/`extension_point`/`status`/`profile` — latency, not decision
+  content; no pod, node, or score value label. That's inherent to the
+  Prometheus metrics model, not a gap: a per-pod-per-node label would be a
+  cardinality explosion. A separate `/metrics/resources` endpoint reports
+  each pod's *already-scheduled* node, but that's the same final-outcome
+  data Tier 1 already has from the Pod object - no candidates, no scores.
+
+- **Logs**: kube-scheduler has historically had a debug line
+  (`"Host %s => Score %d"` in `generic_scheduler.go`) dumping per-node
+  scores, but community reports say it needs `-v=10` and is unreliable even
+  there - log lines aren't covered by Kubernetes' API stability guarantees
+  and can vanish or move between versions without notice. Concretely for
+  this project's target stack: OpenShift's `KubeScheduler` operator API
+  (`openshift/api`'s `operator/v1` `LogLevel` type) only goes up to
+  `TraceAll`, mapped to `-v=8` - *below* the `-v=10` this needs. Even
+  OpenShift's maximum *supported* scheduler verbosity can't reach this data;
+  doing so would mean falling back to the same `unsupportedConfigOverrides`
+  escape hatch already flagged as risky above, with no guarantee the log
+  line still exists in-version.
+
+- **Tracing** (checked as a fourth angle, since Kubernetes has been adding
+  OpenTelemetry support to some components): the
+  [Traces For Kubernetes System Components](https://kubernetes.io/docs/concepts/cluster-administration/system-traces/)
+  docs confirm `--tracing-config-file` support for kube-apiserver and
+  kubelet, but don't mention kube-scheduler at all. No evidence this is a
+  supported mechanism there.
+
+None of these beat the Extender-based partial option above. Real per-node
+score values only ever exist transiently inside the scheduler process
+during the Score/NormalizeScore extension points - there's no external tap
+for that data in stock Kubernetes.
