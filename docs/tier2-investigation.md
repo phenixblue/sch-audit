@@ -136,6 +136,48 @@ cluster-kube-scheduler-operator, or Portworx's for STORK) that could revert
 an unmanaged change; deliberately left as a separate, explicitly-decided
 step rather than something this repo does on its own.
 
+**Attempted (2026-07-24): registering `sch-audit-extender` in the live
+`stork-config` ConfigMap — reverted, no supported override path found.**
+Deployed `cmd/extender` to the aetos-ocp1 cluster (an OpenShift binary
+build straight from local source into the internal registry, since no
+external registry push access was set up - this is also how a real
+in-cluster deployment of any sch-audit component would work without a
+registry pipeline) and confirmed in-cluster connectivity to it. Then
+directly patched the `stork-config` ConfigMap in the `portworx` namespace
+to add `sch-audit-extender` as a second `extenders[]` entry (`filterVerb:
+filter` only, `ignorable: true` so it could never block real scheduling
+even if broken, `nodeCacheCapable: true`). **The edit was reverted by the
+Portworx operator within ~15 seconds** - confirmed reproducibly, the
+`extenders` list was back to just STORK's own entry, exactly the risk
+flagged before attempting it.
+
+Checked two potential supported override mechanisms before concluding this
+is a dead end for now:
+- `StorageCluster.spec.stork.args` - lets the operator pass extra CLI flags
+  to the `kube-scheduler` binary STORK runs as, but `extenders[]` is a
+  `KubeSchedulerConfiguration`-file-only setting; there's no kube-scheduler
+  flag that can add one, so this mechanism doesn't reach the ConfigMap's
+  content at all.
+- `ComponentK8sConfig` (a newer CRD, available on this cluster's operator
+  version 26.1.0 per the "migrate component configuration ... starting with
+  Portworx Operator version 25.5.0" note in
+  [Portworx's docs](https://docs.portworx.com/portworx-enterprise/reference/CRD/storage-cluster))
+  - its schema only covers Deployment/workload-level customization
+  (annotations, labels, placement, priorityClass, container resources/env),
+  not the generated scheduler config file's content.
+
+No instance of `ComponentK8sConfig` exists on this cluster and this wasn't
+an exhaustive search of Portworx's customization surface, so "no supported
+path found" is accurate as of this investigation, not "confirmed
+impossible." Registering this extender for real - against STORK or against
+OpenShift's default-scheduler - remains blocked without either upstream
+cooperation (a supported customization hook from Portworx, or Red Hat
+loosening the default-scheduler's config surface) or an unsupported edit
+made to survive reconciliation (not attempted; that's a call for whoever
+owns the cluster, not something to try unilaterally). `cmd/extender` itself
+is fully built, deployed, and verified working — it's just not wired into
+anything's actual scheduling path yet.
+
 ## Addendum: API / metrics / log scraping, checked directly
 
 A natural follow-up: is there some *other*, non-plugin way to observe
