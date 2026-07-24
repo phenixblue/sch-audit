@@ -1,14 +1,11 @@
-# More info: https://docs.docker.com/engine/reference/builder/#dockerignore-file
-# Ignore everything by default and re-include only needed files
-**
-
-# Re-include Go source files (but not *_test.go)
-!**/*.go
-**/*_test.go
-
-# Re-include Go module files
-!go.mod
-!go.sum
-
-# Re-include static assets compiled in via go:embed (cmd/dashboard)
-!cmd/dashboard/static/**
+# A denylist, not the previous "exclude everything (**), then re-include
+# with ! patterns" approach: that relies on negation-after-blanket-exclude
+# semantics that aren't interpreted identically across build engines. It
+# worked under plain `docker build` but silently dropped the entire cmd/
+# tree ("directory not found") under an OpenShift binary build (buildah) -
+# found deploying cmd/extender. Test files and docs harmlessly riding along
+# in the build context isn't worth that fragility.
+.git
+bin
+cover.out
+*.md
