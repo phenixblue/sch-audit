@@ -178,6 +178,33 @@ owns the cluster, not something to try unilaterally). `cmd/extender` itself
 is fully built, deployed, and verified working — it's just not wired into
 anything's actual scheduling path yet.
 
+**Confirmed working end-to-end (2026-07-24), via a temporary reconciler
+pause.** Scaled `portworx-operator` to 0 replicas (recorded original replica
+count first) so the edit above could survive long enough to test, restarted
+`stork-scheduler` to pick up the new config (kube-scheduler only reads
+`--config` at startup, not on ConfigMap change), then scheduled a real
+`schedulerName: stork` pod. Confirmed real STORK Filter calls reached
+`sch-audit-extender` in-cluster, it recorded all 6 worker nodes as
+candidates via a `CandidateNodes` Event, and the resulting
+`SchedulingDecision` correctly carried that candidate list alongside the
+actual chosen node in `status.transitions[].candidateNodes` - the whole
+pipeline (extender → Event → reconciler → CRD) working against a real
+scheduling decision, not a synthetic curl request. Afterward: deleted the
+test pod/namespace and its SchedulingDecision, restored `stork-config` to
+its exact original content (verified byte-for-byte via checksum),
+restarted `stork-scheduler` again, and scaled `portworx-operator` back to
+its original replica count (1) - confirmed the operator resumed cleanly and
+the cluster settled back to its pre-test state.
+
+This proves the extender-based partial option works for real, but the
+"pause reconciliation, test, restore" pattern only works because scaling
+an operator to 0 is something we could safely do and undo within a short,
+controlled window - it is **not** a way to durably register the extender
+(the moment the operator runs again, an edit made while it's paused gets
+evaluated and reverted on its next reconcile of that resource, same as
+before). Durable registration still needs one of the paths in the
+paragraph above.
+
 ## Addendum: API / metrics / log scraping, checked directly
 
 A natural follow-up: is there some *other*, non-plugin way to observe
